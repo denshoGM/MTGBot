@@ -128,9 +128,37 @@ function parseItalianPrice(value) {
     const price = Number(text.replace(",", "."));
     return Number.isFinite(price) && price > 0 ? price : null;
   }
-
+  
   // Formato decimale con punto, utile per i dati strutturati.
   if (/^\d+\.\d{2}$/.test(text)) {
+    console.log("\n--- DIAGNOSTICA PREZZO AMAZON ---");
+
+    for (const term of [
+      "€",
+      "a-price",
+      "priceToPay",
+      "apexPriceToPay",
+      "priceblock",
+      "buyingPrice",
+      "priceAmount",
+      "priceCurrency",
+      "corePrice",
+      "apex-core-price-identifier",
+      "a-price-whole",
+    ]) {
+      const index = html.toLowerCase().indexOf(term.toLowerCase());
+    
+      console.log(
+        `${term}: ${
+          index >= 0
+            ? html.slice(Math.max(0, index - 250), index + 500)
+                .replace(/\s+/g, " ")
+            : "non trovato"
+        }`
+      );
+    }
+    
+    console.log("--- FINE DIAGNOSTICA ---\n");
     const price = Number(text);
     return Number.isFinite(price) && price > 0 ? price : null;
   }
