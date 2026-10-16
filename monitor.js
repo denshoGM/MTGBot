@@ -1,40 +1,43 @@
-
 const fs = require("node:fs");
-const { chromium } = require("playwright");
 
-const MAX_PRICE = 70;
+const MAX_PRICE = 90; // soglia per i mazzi standard
+const MAX_COLLECTOR_PRICE = 150; // soglia per le Collector's Edition
 const STATE_FILE = "state.json";
 
 const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const CHAT_ID = process.env.TELEGRAM_CHAT_ID;
-const CARDMARKET_USERNAME = process.env.CARDMARKET_USERNAME;
-const CARDMARKET_PASSWORD = process.env.CARDMARKET_PASSWORD;
+const CARDTRADER_TOKEN = process.env.CARDTRADER_TOKEN;
+// Lingue accettate su Cardtrader (codici minuscoli, separati da virgola)
+const CARDTRADER_LANGS = (process.env.CARDTRADER_LANGS || "en,it").split(",").map((s) => s.trim());
 
-const AMAZON_PRODUCTS = [
+const AMZ = "https://www.amazon.it/Magic-Gathering-Universes-Beyond-Warhammer/dp/";
+const CT = "https://www.cardtrader.com/en-EU/cards/";
+
+const PRODUCTS = [
+  { id: "necron-amazon", source: "amazon", name: "Necron Dynasties - Amazon", url: AMZ + "B09ZJBPB34" },
+  { id: "tyranid-amazon", source: "amazon", name: "Tyranid Swarm - Amazon", url: AMZ + "B09ZJC7VGB" },
+
+  { id: "necron-cardtrader", source: "cardtrader", blueprintId: 211580, name: "Necron Dynasties - Cardtrader", url: CT + "211580" },
   {
-    id: "necron-amazon",
-    name: "Necron Dynasties - Amazon",
-    url: "https://www.amazon.it/Magic-Gathering-Universes-Beyond-Warhammer/dp/B09ZJBPB34",
+    id: "necron-collector-cardtrader",
+    source: "cardtrader",
+    blueprintId: 211581,
+    name: "Necron Dynasties (Collector's) - Cardtrader",
+    url: CT + "211581",
+    maxPrice: MAX_COLLECTOR_PRICE,
   },
+  { id: "tyranid-cardtrader", source: "cardtrader", blueprintId: 211576, name: "Tyranid Swarm - Cardtrader", url: CT + "211576" },
   {
-    id: "tyranid-amazon",
-    name: "Tyranid Swarm - Amazon",
-    url: "https://www.amazon.it/Magic-Gathering-Universes-Beyond-Warhammer/dp/B09ZJC7VGB",
+    id: "tyranid-collector-cardtrader",
+    source: "cardtrader",
+    blueprintId: 211577,
+    name: "Tyranid Swarm (Collector's) - Cardtrader",
+    url: CT + "211577",
+    maxPrice: MAX_COLLECTOR_PRICE,
   },
 ];
 
-const CARDMARKET_PRODUCTS = [
-  {
-    id: "necron-cardmarket",
-    name: "Necron Dynasties - Cardmarket",
-    url: "https://www.cardmarket.com/en/Magic/Products/Preconstructed-Decks/Universes-Beyond-Warhammer-40000-Necron-Dynasties-Commander-Deck",
-  },
-  {
-    id: "tyranid-cardmarket",
-    name: "Tyranid Swarm - Cardmarket",
-    url: "https://www.cardmarket.com/en/Magic/Products/Preconstructed-Decks/Universes-Beyond-Warhammer-40000-Tyranid-Swarm-Commander-Deck",
-  },
-];
+// ---------- utilità ----------
 
 function loadState() {
   try {
@@ -48,608 +51,150 @@ function saveState(state) {
   fs.writeFileSync(STATE_FILE, JSON.stringify(state, null, 2) + "\n");
 }
 
-async function sendTelegram(message) {
-  if (!BOT_TOKEN || !CHAT_ID) {
-    throw new Error("Mancano TELEGRAM_BOT_TOKEN o TELEGRAM_CHAT_ID.");
-  }
-
-  const response = await fetch(
-    `https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`,
-    {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ chat_id: CHAT_ID, text: message }),
-    }
-  );
-
-  const result = await response.json().catch(() => ({}));
-
-  if (!response.ok || !result.ok) {
-    throw new Error(
-      `Errore Telegram HTTP ${response.status}: ${
-        result.description || "invio non riuscito"
-      }`
-    );
-  }
+async function sendTelegram(text) {
+  if (!BOT_TOKEN || !CHAT_ID) throw new Error("Mancano TELEGRAM_BOT_TOKEN o TELEGRAM_CHAT_ID.");
+  const res = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ chat_id: CHAT_ID, text }),
+  });
+  const json = await res.json().catch(() => ({}));
+  if (!res.ok || !json.ok) throw new Error(`Telegram HTTP ${res.status}: ${json.description || "errore"}`);
 }
 
-function decodeHtml(value) {
-  return String(value)
-    .replace(/&euro;|&#8364;|&#x20ac;/gi, "€")
-    .replace(/&nbsp;|&#160;/gi, " ")
-    .replace(/&quot;/gi, '"')
-    .replace(/&amp;/gi, "&")
-    .replace(/&lt;/gi, "<")
-    .replace(/&gt;/gi, ">");
-}
-
-function stripTags(value) {
-  return decodeHtml(String(value).replace(/<[^>]*>/g, " "))
+function stripTags(html) {
+  return html
+    .replace(/<(script|style)\b[\s\S]*?<\/\1>/gi, " ")
+    .replace(/<[^>]*>/g, " ")
+    .replace(/&nbsp;/g, " ")
     .replace(/\s+/g, " ")
     .trim();
 }
 
-function parsePrice(value) {
-  if (!value) return null;
-
-  const text = decodeHtml(value)
-    .replace(/\s/g, "")
-    .replace(/[^\d.,]/g, "");
-
-  let normalized;
-
-  if (/^\d{1,3}(?:\.\d{3})+,\d{2}$/.test(text)) {
-    normalized = text.replace(/\./g, "").replace(",", ".");
-  } else if (/^\d+,\d{2}$/.test(text)) {
-    normalized = text.replace(",", ".");
-  } else if (/^\d+\.\d{2}$/.test(text)) {
-    normalized = text;
-  } else {
-    return null;
-  }
-
-  const price = Number(normalized);
-  return Number.isFinite(price) && price > 0 ? price : null;
+// "1.234,56 €" / "49,90" / "49.90" -> numero
+function parsePrice(text) {
+  const t = String(text ?? "").replace(/[^\d.,]/g, "");
+  let n;
+  if (/^\d{1,3}(\.\d{3})+,\d{2}$/.test(t)) n = t.replace(/\./g, "").replace(",", ".");
+  else if (/^\d+,\d{2}$/.test(t)) n = t.replace(",", ".");
+  else if (/^\d+\.\d{2}$/.test(t)) n = t;
+  else return null;
+  const v = Number(n);
+  return v > 0 ? v : null;
 }
 
-async function notifyIfNeeded(product, price, shipping, state) {
-  const previous = state[product.id] || {};
-  const qualifies = price !== null && price <= MAX_PRICE;
+// Notifica solo la prima volta che il prezzo scende sotto soglia.
+async function handleResult(product, price, state) {
+  const prev = state[product.id] || {};
+  const limit = product.maxPrice ?? MAX_PRICE;
+  const ok = price !== null && price <= limit;
 
-  if (!qualifies) {
-    state[product.id] = {
-      ...previous,
-      notified: false,
-      lastPrice: price,
-      checkedAt: new Date().toISOString(),
-    };
-    return;
-  }
-
-  if (previous.notified !== true) {
-    const shippingText =
-      shipping !== null
-        ? `Spedizione: €${shipping.toFixed(2)}\n`
-        : "";
-
-    const totalText =
-      shipping !== null
-        ? `Totale prodotto + spedizione: €${(price + shipping).toFixed(2)}\n`
-        : "";
-
+  if (ok && !prev.notified) {
     await sendTelegram(
-      `Possibile offerta: ${product.name}\n` +
-        `Prezzo rilevato: €${price.toFixed(2)}\n` +
-        shippingText +
-        totalText +
-        `Link: ${product.url}\n\n` +
-        "Verifica disponibilità, lingua del prodotto e condizioni del venditore."
+      `Possibile offerta: ${product.name}\nPrezzo: €${price.toFixed(2)}\nSpedizione: da verificare\n` +
+        `Link: ${product.url}\n\nVerifica disponibilità, lingua e condizioni del venditore.`
     );
-
-    console.log(`Notifica Telegram inviata: ${product.name}`);
-  } else {
-    console.log(`Offerta già notificata: ${product.name}`);
+    console.log("Notifica inviata.");
   }
 
-  state[product.id] = {
-    notified: true,
-    lastPrice: price,
-    checkedAt: new Date().toISOString(),
-  };
+  state[product.id] = { notified: ok, lastPrice: price, checkedAt: new Date().toISOString() };
 }
 
-// -------------------- AMAZON --------------------
+// ---------- Amazon ----------
 
-async function getAmazonPage(url) {
-  const response = await fetch(url, {
-    redirect: "follow",
+async function checkAmazon(product, state) {
+  const res = await fetch(product.url, {
     signal: AbortSignal.timeout(30000),
     headers: {
       "User-Agent":
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) " +
-        "AppleWebKit/537.36 (KHTML, like Gecko) " +
-        "Chrome/131.0.0.0 Safari/537.36",
-      Accept:
-        "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-      "Accept-Language": "it-IT,it;q=0.9,en-US;q=0.8,en;q=0.7",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+      "Accept-Language": "it-IT,it;q=0.9",
     },
   });
+  const html = await res.text();
+  console.log(`HTTP ${res.status}, ${html.length} caratteri`);
+  if (!res.ok) return console.log("Risposta non valida; stato invariato.");
+  if (!/id=["']productTitle["']/.test(html)) return console.log("Pagina prodotto non trovata (captcha?); stato invariato.");
 
-  return {
-    status: response.status,
-    finalUrl: response.url,
-    html: await response.text(),
-  };
+  const block = html.match(/id=["']availability["'][^>]*>([\s\S]{0,3000}?)<\/div>/i);
+  const availText = block ? stripTags(block[1]).toLowerCase() : "";
+  console.log(`Disponibilità: ${availText.slice(0, 120) || "(vuoto)"}`);
+
+  if (/non disponibile|esaurito|unavailable|out of stock/.test(availText)) {
+    state[product.id] = { notified: false, lastPrice: null, checkedAt: new Date().toISOString() };
+    return console.log("Non disponibile.");
+  }
+
+  const start = html.search(/id=["'](corePrice_feature_div|corePriceDisplay_desktop_feature_div|apex_desktop)["']/);
+  let price = null;
+  if (start >= 0) {
+    for (const m of html.slice(start, start + 30000).matchAll(/class=["'][^"']*a-offscreen[^"']*["'][^>]*>([^<]*)</g)) {
+      price = parsePrice(m[1]);
+      if (price !== null) break;
+    }
+  }
+  if (price === null) return console.log("Prezzo non trovato; stato invariato.");
+
+  console.log(`Prezzo: €${price.toFixed(2)}`);
+  await handleResult(product, price, state);
 }
 
-function extractAmazonAvailability(html) {
-  const match = html.match(
-    /<[^>]*id=["']availability["'][^>]*>([\s\S]{0,5000})/i
-  );
+// ---------- Cardtrader (API ufficiale) ----------
 
-  const details = match ? stripTags(match[1]).slice(0, 1000) : "";
-  const text = details.toLowerCase();
+async function checkCardtrader(product, state) {
+  if (!CARDTRADER_TOKEN) return console.log("Manca CARDTRADER_TOKEN; salto.");
 
-  if (
-    /attualmente non disponibile|temporaneamente esaurito|non disponibile|currently unavailable|out of stock|temporarily out of stock/.test(
-      text
-    )
-  ) {
-    return { status: "unavailable", details };
+  const res = await fetch(`https://api.cardtrader.com/api/v2/marketplace/products?blueprint_id=${product.blueprintId}`, {
+    headers: { Authorization: `Bearer ${CARDTRADER_TOKEN}` },
+    signal: AbortSignal.timeout(30000),
+  });
+  console.log(`HTTP ${res.status}`);
+  if (!res.ok) return console.log("Errore API (401 = token errato); stato invariato.");
+
+  const data = await res.json();
+  const list = Array.isArray(data) ? data : Object.values(data).flat();
+
+  const prices = [];
+  for (const o of list) {
+    const cents = o.price?.cents ?? o.price_cents;
+    const currency = String(o.price?.currency ?? o.price_currency ?? "EUR").toUpperCase();
+    const lang = o.properties_hash?.mtg_language;
+    if (typeof cents !== "number" || currency !== "EUR") continue;
+    if (lang && !CARDTRADER_LANGS.includes(lang)) continue;
+    if (o.quantity != null && o.quantity < 1) continue;
+    prices.push(cents / 100);
   }
 
-  if (/disponibile|in stock|usually ships|spedito entro|consegna/.test(text)) {
-    return { status: "available", details };
+  console.log(`Offerte ${CARDTRADER_LANGS.join("/")} trovate: ${prices.length} (su ${list.length})`);
+  if (prices.length === 0) {
+    state[product.id] = { notified: false, lastPrice: null, checkedAt: new Date().toISOString() };
+    return console.log("Nessuna offerta valida.");
   }
 
-  if (
-    /id=["']add-to-cart-button["']/.test(html) &&
-    !/non disponibile|out of stock/i.test(details)
-  ) {
-    return {
-      status: "available",
-      details: "Pulsante aggiunta al carrello presente",
-    };
-  }
-
-  return { status: "unknown", details };
+  const best = Math.min(...prices);
+  console.log(`Prezzo minimo: €${best.toFixed(2)}`);
+  await handleResult(product, best, state);
 }
 
-function extractAmazonPrice(html) {
-  const ids = [
-    "corePrice_feature_div",
-    "corePriceDisplay_desktop_feature_div",
-    "corePrice_desktop",
-    "apex_desktop",
-    "priceblock_ourprice",
-    "priceblock_dealprice",
-    "price_inside_buybox",
-  ];
-
-  for (const id of ids) {
-    const escaped = id.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-    const match = html.match(
-      new RegExp(`<[^>]*id=["']${escaped}["'][^>]*>`, "i")
-    );
-
-    if (!match || match.index === undefined) continue;
-
-    const block = html.slice(match.index, match.index + 30000);
-
-    for (const priceMatch of block.matchAll(
-      /<span\b[^>]*class=["'][^"']*\ba-offscreen\b[^"']*["'][^>]*>([\s\S]*?)<\/span>/gi
-    )) {
-      const price = parsePrice(stripTags(priceMatch[1]));
-      if (price !== null) return price;
-    }
-
-    const whole = block.match(
-      /class=["'][^"']*\ba-price-whole\b[^"']*["'][^>]*>\s*([\d.,]+)/
-    );
-    const fraction = block.match(
-      /class=["'][^"']*\ba-price-fraction\b[^"']*["'][^>]*>\s*(\d{2})/
-    );
-
-    if (whole && fraction) {
-      const price = parsePrice(
-        `${whole[1].replace(/[.,]/g, "")},${fraction[1]}`
-      );
-      if (price !== null) return price;
-    }
-  }
-
-  for (const match of html.matchAll(
-    /<script\b[^>]*type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi
-  )) {
-    try {
-      const parsed = JSON.parse(match[1]);
-      const objects = Array.isArray(parsed) ? parsed : [parsed];
-
-      for (const object of objects) {
-        const candidates = [
-          object,
-          ...(Array.isArray(object["@graph"]) ? object["@graph"] : []),
-        ];
-
-        for (const candidate of candidates) {
-          const offers = Array.isArray(candidate.offers)
-            ? candidate.offers
-            : candidate.offers
-              ? [candidate.offers]
-              : [];
-
-          for (const offer of offers) {
-            if (String(offer.priceCurrency).toUpperCase() !== "EUR") continue;
-            const price = parsePrice(offer.price);
-            if (price !== null) return price;
-          }
-        }
-      }
-    } catch {
-      // Ignora JSON-LD non valido.
-    }
-  }
-
-  return null;
-}
-
-async function checkAmazon(product, state) {
-  console.log(`\nControllo Amazon: ${product.name}`);
-
-  try {
-    const { status, finalUrl, html } = await getAmazonPage(product.url);
-
-    console.log(`HTTP: ${status}; HTML: ${html.length} caratteri`);
-
-    if (status < 200 || status >= 300) {
-      console.log("Controllo Amazon fallito: risposta HTTP non valida.");
-      return;
-    }
-
-    if (
-      /captcha|robot check|validatecaptcha|automated access|continua con gli acquisti/i.test(
-        html
-      ) &&
-      !/id=["']productTitle["']/.test(html)
-    ) {
-      console.log("Amazon ha restituito una pagina di verifica.");
-      return;
-    }
-
-    if (!/B09ZJBPB34|B09ZJC7VGB|productTitle/i.test(html)) {
-      console.log(`La pagina potrebbe non essere quella del prodotto: ${finalUrl}`);
-    }
-
-    const availability = extractAmazonAvailability(html);
-    console.log(`Disponibilità: ${availability.status}`);
-
-    if (availability.details) {
-      console.log(`Dettagli: ${availability.details}`);
-    }
-
-    if (availability.status === "unknown") {
-      console.log("Disponibilità non verificabile; stato invariato.");
-      return;
-    }
-
-    if (availability.status === "unavailable") {
-      console.log("Prodotto non disponibile.");
-      state[product.id] = {
-        notified: false,
-        lastPrice: null,
-        checkedAt: new Date().toISOString(),
-      };
-      return;
-    }
-
-    const price = extractAmazonPrice(html);
-
-    if (price === null) {
-      console.log("Disponibile, ma prezzo non trovato; stato invariato.");
-      return;
-    }
-
-    console.log(`Prezzo Amazon: €${price.toFixed(2)}`);
-    await notifyIfNeeded(product, price, null, state);
-  } catch (error) {
-    console.error(`Errore Amazon ${product.name}: ${error.message}`);
-  }
-}
-
-// -------------------- CARDMARKET LOGIN --------------------
-
-async function firstVisibleLocator(page, selectors) {
-  for (const selector of selectors) {
-    const locator = page.locator(selector).first();
-
-    try {
-      if (await locator.isVisible({ timeout: 1000 })) {
-        return locator;
-      }
-    } catch {
-      // Prova il selettore successivo.
-    }
-  }
-
-  return null;
-}
-
-async function loginCardmarket(context) {
-  if (!CARDMARKET_USERNAME || !CARDMARKET_PASSWORD) {
-    throw new Error(
-      "Mancano i secrets CARDMARKET_USERNAME e CARDMARKET_PASSWORD."
-    );
-  }
-
-  const page = await context.newPage();
-
-  try {
-    console.log("Apro la pagina di login Cardmarket.");
-
-    const response = await page.goto(
-      "https://www.cardmarket.com/en/Magic/Account/Login",
-      {
-        waitUntil: "domcontentloaded",
-        timeout: 45000,
-      }
-    );
-
-    const status = response ? response.status() : 0;
-    console.log(`HTTP login Cardmarket: ${status}`);
-
-    if (status === 403 || status === 429) {
-      throw new Error(
-        `Cardmarket ha rifiutato la pagina di login (HTTP ${status}).`
-      );
-    }
-
-    if (status >= 400) {
-      throw new Error(`Pagina di login non accessibile (HTTP ${status}).`);
-    }
-
-    const bodyText = await page.locator("body").innerText().catch(() => "");
-
-    if (/captcha|access denied|verify you are human/i.test(bodyText)) {
-      throw new Error(
-        "Cardmarket richiede una verifica di sicurezza. Login automatico interrotto."
-      );
-    }
-
-    const usernameInput = await firstVisibleLocator(page, [
-      'input[name="username"]',
-      'input[name="email"]',
-      'input[name="user"]',
-      'input[id*="username" i]',
-      'input[id*="email" i]',
-      'input[autocomplete="username"]',
-      'input[type="email"]',
-      'input[type="text"]',
-    ]);
-
-    const passwordInput = await firstVisibleLocator(page, [
-      'input[name="password"]',
-      'input[id*="password" i]',
-      'input[autocomplete="current-password"]',
-      'input[type="password"]',
-    ]);
-
-    if (!usernameInput || !passwordInput) {
-      throw new Error(
-        "Non trovo i campi di login attesi. La pagina o i selettori potrebbero essere cambiati."
-      );
-    }
-
-    await usernameInput.fill(CARDMARKET_USERNAME);
-    await passwordInput.fill(CARDMARKET_PASSWORD);
-
-    const submitButton = await firstVisibleLocator(page, [
-      'button[type="submit"]',
-      'input[type="submit"]',
-      'button:has-text("Log in")',
-      'button:has-text("Login")',
-      'button:has-text("Sign in")',
-      'button:has-text("Accedi")',
-    ]);
-
-    if (submitButton) {
-      await submitButton.click();
-    } else {
-      await passwordInput.press("Enter");
-    }
-
-    await page.waitForLoadState("domcontentloaded", { timeout: 15000 }).catch(
-      () => {}
-    );
-    await page.waitForTimeout(2000);
-
-    const afterText = await page.locator("body").innerText().catch(() => "");
-
-    if (/captcha|access denied|verify you are human/i.test(afterText)) {
-      throw new Error(
-        "Cardmarket ha richiesto una verifica di sicurezza dopo il login."
-      );
-    }
-
-    const passwordStillVisible = await page
-      .locator('input[type="password"]')
-      .first()
-      .isVisible()
-      .catch(() => false);
-
-    if (passwordStillVisible) {
-      const errorText = await page
-        .locator(
-          '[role="alert"], .alert-danger, .invalid-feedback, .form-error'
-        )
-        .allInnerTexts()
-        .catch(() => []);
-
-      throw new Error(
-        "Login non confermato. " +
-          (errorText.join(" ").trim() || "Controlla credenziali e struttura della pagina.")
-      );
-    }
-
-    console.log("Login Cardmarket completato (da verificare sulle pagine prodotto).");
-  } finally {
-    await page.close();
-  }
-}
-
-// -------------------- CARDMARKET PRICES --------------------
-
-async function checkCardmarket(context, product, state) {
-  console.log(`\nControllo Cardmarket: ${product.name}`);
-
-  const page = await context.newPage();
-
-  try {
-    const response = await page.goto(product.url, {
-      waitUntil: "domcontentloaded",
-      timeout: 45000,
-    });
-
-    const status = response ? response.status() : 0;
-    console.log(`HTTP Cardmarket: ${status}`);
-
-    if (status === 403 || status === 429) {
-      console.log("Cardmarket ha rifiutato o limitato la richiesta; stato invariato.");
-      return;
-    }
-
-    if (status >= 400) {
-      console.log(`Controllo fallito: HTTP ${status}; stato invariato.`);
-      return;
-    }
-
-    const bodyText = await page.locator("body").innerText().catch(() => "");
-
-    if (/captcha|access denied|verify you are human/i.test(bodyText)) {
-      console.log("Cardmarket richiede una verifica; stato invariato.");
-      return;
-    }
-
-    const title = await page.title().catch(() => "");
-    console.log(`Titolo pagina: ${title}`);
-
-    const table = page.locator("div.table.article-table");
-    const tableCount = await table.count();
-
-    if (tableCount === 0) {
-      console.log(
-        "Tabella offerte non trovata. Potrebbe essere una pagina di login, un layout cambiato o un prodotto senza offerte; stato invariato."
-      );
-      return;
-    }
-
-    const containers = table.locator(".price-container");
-    const count = await containers.count();
-
-    console.log(`Contenitori prezzo trovati: ${count}`);
-
-    if (count === 0) {
-      console.log("Nessun prezzo leggibile; stato invariato.");
-      return;
-    }
-
-    const offers = [];
-
-    for (let i = 0; i < count; i++) {
-      const container = containers.nth(i);
-
-      const priceText = await container
-        .locator(".color-primary")
-        .first()
-        .innerText()
-        .catch(() => "");
-
-      const shippingText = await container
-        .locator(".ms-1")
-        .first()
-        .innerText()
-        .catch(() => "");
-
-      const price = parsePrice(priceText);
-      const shipping = parsePrice(shippingText);
-
-      if (price === null) continue;
-
-      offers.push({
-        price,
-        shipping,
-        total: price + (shipping ?? 0),
-      });
-    }
-
-    if (offers.length === 0) {
-      console.log("Nessun prezzo valido trovato; stato invariato.");
-      return;
-    }
-
-    offers.sort((a, b) => a.total - b.total);
-    const best = offers[0];
-
-    console.log(`Offerte valide: ${offers.length}`);
-    console.log(`Prezzo articolo: €${best.price.toFixed(2)}`);
-    console.log(
-      `Spedizione: ${
-        best.shipping === null ? "non rilevata" : `€${best.shipping.toFixed(2)}`
-      }`
-    );
-    console.log(`Totale minimo: €${best.total.toFixed(2)}`);
-
-    await notifyIfNeeded(product, best.price, best.shipping, state);
-  } catch (error) {
-    console.error(`Errore Cardmarket ${product.name}: ${error.message}`);
-  } finally {
-    await page.close();
-  }
-}
-
-// -------------------- MAIN --------------------
+// ---------- main ----------
 
 async function main() {
-  console.log("Avvio monitor Warhammer.");
-  console.log(`Prezzo massimo articolo: €${MAX_PRICE.toFixed(2)}`);
-
   const state = loadState();
+  console.log(`Monitor Warhammer - soglie: standard €${MAX_PRICE}, collector €${MAX_COLLECTOR_PRICE}`);
 
-  for (const product of AMAZON_PRODUCTS) {
-    await checkAmazon(product, state);
+  for (const product of PRODUCTS) {
+    console.log(`\n${product.name}`);
+    try {
+      if (product.source === "amazon") await checkAmazon(product, state);
+      else await checkCardtrader(product, state);
+    } catch (e) {
+      console.error(`Errore: ${e.message}`);
+    }
     saveState(state);
   }
-
-  const browser = await chromium.launch({ headless: true });
-
-  try {
-    const context = await browser.newContext({
-      locale: "en-GB",
-      viewport: { width: 1365, height: 900 },
-    });
-
-    try {
-      await loginCardmarket(context);
-
-      for (const product of CARDMARKET_PRODUCTS) {
-        await checkCardmarket(context, product, state);
-        saveState(state);
-      }
-    } catch (error) {
-      console.error(`Login/sessione Cardmarket non disponibile: ${error.message}`);
-      console.error(
-        "I controlli Cardmarket vengono saltati; lo stato delle offerte non viene azzerato."
-      );
-    } finally {
-      await context.close();
-    }
-  } finally {
-    await browser.close();
-  }
-
-  console.log("\nControllo terminato.");
 }
 
-main().catch((error) => {
-  console.error("Errore fatale:", error);
+main().catch((e) => {
+  console.error("Errore fatale:", e);
   process.exitCode = 1;
 });
