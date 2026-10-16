@@ -1,1 +1,12 @@
-{}
+{
+  "necron-amazon": {
+    "notified": false,
+    "lastPrice": null,
+    "checkedAt": "2026-10-16T18:15:58.868Z"
+  },
+  "tyranid-amazon": {
+    "notified": false,
+    "lastPrice": null,
+    "checkedAt": "2026-10-16T18:15:59.639Z"
+  }
+}
