@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: warhammer-price-monitor
@@ -20,13 +20,18 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-        with:
-          ref: ${{ github.ref_name }}
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: "24"
+
+      - name: Restore state
+        uses: actions/cache/restore@v4
+        with:
+          path: state.json
+          key: state-${{ github.run_id }}
+          restore-keys: state-
 
       - name: Run price monitor
         env:
@@ -35,13 +40,9 @@ jobs:
           CARDTRADER_TOKEN: ${{ secrets.CARDTRADER_TOKEN }}
         run: npm run monitor
 
-      - name: Save monitoring state
+      - name: Save state
         if: always()
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add state.json
-          if ! git diff --cached --quiet; then
-            git commit -m "Update product monitoring state"
-            git push
-          fi
+        uses: actions/cache/save@v4
+        with:
+          path: state.json
+          key: state-${{ github.run_id }}
