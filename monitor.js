@@ -9,10 +9,6 @@ const MAX_COLLECTOR_PRICE = 150; // soglia per le Collector's (link Cardtrader c
 const AMAZON_URLS = [
   "https://www.amazon.it/Magic-Gathering-Universes-Beyond-Warhammer/dp/B09ZJBPB34",
   "https://www.amazon.it/Magic-Gathering-Universes-Beyond-Warhammer/dp/B09ZJC7VGB",
-  "https://www.amazon.de/Magic-Gathering-Universes-Warhammer-Commander/dp/B09ZJC7VGB?th=1",
-  "https://www.amazon.de/Magic-Gathering-Beyond-Multiverse-Corruption/dp/B0BMLWH9GX",
-  "https://www.amazon.fr/Magic-Gathering-Universes-Beyond-Warhammer/dp/B09ZJC7VGB?th=1",
-  "https://www.amazon.fr/Magic-Gathering-Universes-Beyond-Warhammer/dp/B09ZJBPB34?th=1",
 ];
 
 const CARDTRADER_URLS = [
@@ -39,7 +35,8 @@ const CARDTRADER_LANGS = (process.env.CARDTRADER_LANGS || "en,it").split(",").ma
 const PRODUCTS = [
   ...AMAZON_URLS.map((url) => {
     const asin = url.match(/\/dp\/([A-Z0-9]{10})/)?.[1] || url;
-    return { source: "amazon", url, id: `amazon-${asin}`, name: `Amazon ${asin}`, maxPrice: MAX_PRICE };
+    const site = new URL(url).hostname.split(".").pop(); // it, de, fr, es...
+    return { source: "amazon", url, id: `amazon-${site}-${asin}`, name: `Amazon.${site} ${asin}`, maxPrice: MAX_PRICE };
   }),
   ...CARDTRADER_URLS.map((url) => {
     const [, blueprintId, slug] = url.match(/\/cards\/(\d+)-([^/?#]+)/) || [];
@@ -168,6 +165,20 @@ async function checkWizardsAnnouncements(state) {
 
 // ============ AMAZON ============
 
+// Frasi "non disponibile" nelle lingue dei vari Amazon (italiano, spagnolo, francese, tedesco, inglese).
+const AMAZON_UNAVAILABLE =
+  /non disponibile|no disponible|esaurito|agotado|indisponible|rupture de stock|nicht verfügbar|nicht auf lager|ausverkauft|unavailable|out of stock/;
+
+// Lingua della richiesta in base al dominio (.de -> tedesco, .fr -> francese, ...).
+function amazonLanguage(url) {
+  const langs = {
+    de: "de-DE,de;q=0.9,en;q=0.7",
+    fr: "fr-FR,fr;q=0.9,en;q=0.7",
+    es: "es-ES,es;q=0.9,en;q=0.7",
+  };
+  return langs[new URL(url).hostname.split(".").pop()] || "it-IT,it;q=0.9,en-US;q=0.8,en;q=0.7";
+}
+
 // Amazon a volte risponde con una pagina di verifica (breve, senza productTitle): riprova fino a 3 volte.
 async function fetchAmazonHtml(url) {
   for (let attempt = 1; attempt <= 3; attempt++) {
@@ -178,7 +189,7 @@ async function fetchAmazonHtml(url) {
           "User-Agent":
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
           Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-          "Accept-Language": "it-IT,it;q=0.9,en-US;q=0.8,en;q=0.7",
+          "Accept-Language": amazonLanguage(url),
           "Upgrade-Insecure-Requests": "1",
         },
       });
@@ -208,7 +219,7 @@ async function checkAmazon(product, state) {
 
   const hasCartButton = /id=["']add-to-cart-button["']/.test(html);
 
-  if (/non disponibile|esaurito|unavailable|out of stock/.test(availText) || (!availText && !hasCartButton)) {
+  if (AMAZON_UNAVAILABLE.test(availText) || (!availText && !hasCartButton)) {
     state[product.id] = { notified: false };
     return console.log("Non disponibile.");
   }
