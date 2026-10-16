@@ -1,9 +1,12 @@
+const https = require("https");
 const { chromium } = require("playwright");
 
-const MAX_PRICE = 90;
+const MAX_PRICE = 70;
 
 const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const CHAT_ID = process.env.TELEGRAM_CHAT_ID;
+
+const AMAZON_HOME = "https://www.amazon.it/";
 
 const AMAZON_PRODUCTS = [
   {
@@ -37,10 +40,7 @@ async function sendTelegram(message) {
     {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        chat_id: CHAT_ID,
-        text: message,
-      }),
+      body: JSON.stringify({ chat_id: CHAT_ID, text: message }),
     }
   );
 
@@ -67,7 +67,7 @@ async function notifyOffer(product, price) {
   await sendTelegram(message);
 }
 
-// ---------------- AMAZON: SOLO HTTP, NESSUN PLAYWRIGHT ----------------
+// ---------------- AMAZON: SOLO HTTP ----------------
 
 async function getAmazonPage(url) {
   const response = await fetch(url, {
@@ -77,8 +77,8 @@ async function getAmazonPage(url) {
       "User-Agent":
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) " +
         "AppleWebKit/537.36 (KHTML, like Gecko) " +
-        "Chrome/131.0.0.0 Safari/537.36",
-      "Accept":
+        "Chrome/151.0.0.0 Safari/537.36",
+      Accept:
         "text/html,application/xhtml+xml,application/xml;q=0.9," +
         "image/avif,image/webp,*/*;q=0.8",
       "Accept-Language": "it-IT,it;q=0.9,en-US;q=0.8,en;q=0.7",
@@ -86,13 +86,31 @@ async function getAmazonPage(url) {
     },
   });
 
-  const html = await response.text();
-
   return {
     status: response.status,
     finalUrl: response.url,
-    html,
+    html: await response.text(),
   };
+}
+
+// Visita la homepage una volta prima dei prodotti.
+// Questo non garantisce che Amazon non richieda altre verifiche.
+async function warmUpAmazon() {
+  console.log("\nVisita iniziale Amazon.it via HTTP");
+
+  try {
+    const { status, finalUrl, html } = await getAmazonPage(AMAZON_HOME);
+
+    console.log(`Homepage HTTP status: ${status}`);
+    console.log(`Homepage URL finale: ${finalUrl}`);
+    console.log(`Homepage HTML: ${html.length} caratteri`);
+
+    if (/captcha|robot check|validatecaptcha/i.test(html)) {
+      console.log("La homepage stessa restituisce una verifica Amazon.");
+    }
+  } catch (error) {
+    console.error(`Errore visita iniziale Amazon: ${error.message}`);
+  }
 }
 
 function decodeHtml(value) {
@@ -112,107 +130,35 @@ function stripTags(value) {
 }
 
 function parseItalianPrice(value) {
-  if (!value) return null;
+  if (value == null) return null;
 
-  const text = decodeHtml(String(value))
-    .replace(/\s/g, "")
-    .replace(/[^\d.,]/g, "");
+  const text = String(value).replace(/\s/g, "").replace(/[^\d.,]/g, "");
 
-  // Formato italiano: 1.234,56 oppure 69,99
+  let normalized;
+
   if (/^\d{1,3}(?:\.\d{3})+,\d{2}$/.test(text)) {
-    const price = Number(text.replace(/\./g, "").replace(",", "."));
-    return Number.isFinite(price) && price > 0 ? price : null;
+    normalized = text.replace(/\./g, "").replace(",", ".");
+  } else if (/^\d+,\d{2}$/.test(text)) {
+    normalized = text.replace(",", ".");
+  } else if (/^\d+\.\d{2}$/.test(text)) {
+    normalized = text;
+  } else {
+    return null;
   }
 
-  if (/^\d+,\d{2}$/.test(text)) {
-    const price = Number(text.replace(",", "."));
-    return Number.isFinite(price) && price > 0 ? price : null;
-  }
-  
-  // Formato decimale con punto, utile per i dati strutturati.
-  if (/^\d+\.\d{2}$/.test(text)) {
-    console.log("\n--- DIAGNOSTICA PREZZO AMAZON ---");
-
-    for (const term of [
-      "€",
-      "a-price",
-      "priceToPay",
-      "apexPriceToPay",
-      "priceblock",
-      "buyingPrice",
-      "priceAmount",
-      "priceCurrency",
-      "corePrice",
-      "apex-core-price-identifier",
-      "a-price-whole",
-    ]) {
-      const index = html.toLowerCase().indexOf(term.toLowerCase());
-    
-      console.log(
-        `${term}: ${
-          index >= 0
-            ? html.slice(Math.max(0, index - 250), index + 500)
-                .replace(/\s+/g, " ")
-            : "non trovato"
-        }`
-      );
-    }
-    
-    console.log("--- FINE DIAGNOSTICA ---\n");
-    const price = Number(text);
-    return Number.isFinite(price) && price > 0 ? price : null;
-  }
-
-  return null;
+  const price = Number(normalized);
+  return Number.isFinite(price) && price > 0 ? price : null;
 }
 
-function priceFromHtmlBlock(html, selectors) {
-  for (const selector of selectors) {
-    const escaped = selector.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-
-    const blockPattern = new RegExp(
-      `<[^>]*id=["']${escaped}["'][^>]*>([\\s\\S]{0,12000}?)<\\/[^>]+>`,
-      "i"
-    );
-
-    const block = html.match(blockPattern)?.[1];
-
-    if (!block) continue;
-
-    const priceElements = [
-      ...block.matchAll(
-        /<span\b[^>]*class=["'][^"']*\ba-offscreen\b[^"']*["'][^>]*>([\s\S]*?)<\/span>/gi
-      ),
-    ];
-
-    for (const element of priceElements) {
-      const price = parseItalianPrice(stripTags(element[1]));
-      if (price !== null) return price;
-    }
-
-    // Fallback limitato al contenitore prezzo.
-    const euroMatch = stripTags(block).match(
-      /€\s*(\d{1,3}(?:\.\d{3})*,\d{2}|\d+,\d{2})|(\d{1,3}(?:\.\d{3})*,\d{2}|\d+,\d{2})\s*€/
-    );
-
-    if (euroMatch) {
-      const price = parseItalianPrice(euroMatch[1] || euroMatch[2]);
-      if (price !== null) return price;
-    }
-  }
-
-  return null;
-}
-
-function priceFromJsonLd(html) {
+function extractPriceFromJsonLd(html) {
   const scripts = html.matchAll(
     /<script\b[^>]*type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi
   );
 
   for (const script of scripts) {
     try {
-      const data = JSON.parse(script[1].trim());
-      const objects = Array.isArray(data) ? data : [data];
+      const parsed = JSON.parse(script[1].trim());
+      const objects = Array.isArray(parsed) ? parsed : [parsed];
 
       for (const object of objects) {
         const candidates = [
@@ -221,17 +167,18 @@ function priceFromJsonLd(html) {
         ];
 
         for (const candidate of candidates) {
-          const offers = candidate.offers;
-          const offerList = Array.isArray(offers)
-            ? offers
-            : offers
-              ? [offers]
+          const offers = Array.isArray(candidate.offers)
+            ? candidate.offers
+            : candidate.offers
+              ? [candidate.offers]
               : [];
 
-          for (const offer of offerList) {
-            const currency = String(offer.priceCurrency || "").toUpperCase();
-
-            if (currency !== "EUR" || offer.price == null) continue;
+          for (const offer of offers) {
+            if (
+              String(offer.priceCurrency || "").toUpperCase() !== "EUR"
+            ) {
+              continue;
+            }
 
             const price = parseItalianPrice(offer.price);
             if (price !== null) return price;
@@ -239,11 +186,99 @@ function priceFromJsonLd(html) {
         }
       }
     } catch {
-      // Ignora JSON-LD non valido.
+      // Ignora blocchi JSON non validi.
     }
   }
 
   return null;
+}
+
+function extractAmazonPrice(html) {
+  // Prima cerca gli elementi di prezzo dentro i contenitori Amazon noti.
+  const containers = [
+    "corePrice_feature_div",
+    "corePriceDisplay_desktop_feature_div",
+    "corePrice_desktop",
+    "apex_desktop",
+    "priceblock_ourprice",
+    "priceblock_dealprice",
+    "price_inside_buybox",
+  ];
+
+  for (const id of containers) {
+    const escapedId = id.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+    const match = html.match(
+      new RegExp(
+        `<[^>]*id=["']${escapedId}["'][^>]*>([\\s\\S]{0,15000}?)<\\/[^>]+>`,
+        "i"
+      )
+    );
+
+    if (!match) continue;
+
+    const block = match[1];
+    const offscreen = block.matchAll(
+      /<span\b[^>]*class=["'][^"']*\ba-offscreen\b[^"']*["'][^>]*>([\s\S]*?)<\/span>/gi
+    );
+
+    for (const element of offscreen) {
+      const price = parseItalianPrice(stripTags(element[1]));
+      if (price !== null) return price;
+    }
+  }
+
+  // Cerca i dati strutturati JSON-LD.
+  const jsonLdPrice = extractPriceFromJsonLd(html);
+  if (jsonLdPrice !== null) return jsonLdPrice;
+
+  // Cerca elementi di prezzo noti, senza interpretare numeri casuali
+  // presenti nel resto della pagina come se fossero prezzi.
+  const pricePatterns = [
+    /<span\b[^>]*class=["'][^"']*\ba-offscreen\b[^"']*["'][^>]*>\s*([^<]*€[^<]*)<\/span>/gi,
+    /<span\b[^>]*class=["'][^"']*\ba-offscreen\b[^"']*["'][^>]*>\s*([^<]*\d+[.,]\d{2}[^<]*)<\/span>/gi,
+  ];
+
+  for (const pattern of pricePatterns) {
+    for (const match of html.matchAll(pattern)) {
+      const price = parseItalianPrice(match[1]);
+      if (price !== null) return price;
+    }
+  }
+
+  return null;
+}
+
+function diagnoseAmazonHtml(html) {
+  console.log("\n--- DIAGNOSTICA PREZZO AMAZON ---");
+
+  for (const term of [
+    "€",
+    "a-price",
+    "priceToPay",
+    "apexPriceToPay",
+    "priceblock",
+    "buyingPrice",
+    "priceAmount",
+    "priceCurrency",
+    "corePrice",
+    "apex-core-price-identifier",
+    "a-price-whole",
+  ]) {
+    const index = html.toLowerCase().indexOf(term.toLowerCase());
+
+    console.log(
+      `${term}: ${
+        index >= 0
+          ? html
+              .slice(Math.max(0, index - 250), index + 500)
+              .replace(/\s+/g, " ")
+          : "non trovato"
+      }`
+    );
+  }
+
+  console.log("--- FINE DIAGNOSTICA ---\n");
 }
 
 async function checkAmazon(product) {
@@ -257,8 +292,7 @@ async function checkAmazon(product) {
     console.log(`Dimensione HTML: ${html.length} caratteri`);
 
     if (status < 200 || status >= 300) {
-      console.log("Amazon non ha restituito una pagina valida.");
-      console.log(`Inizio risposta: ${stripTags(html).slice(0, 250)}`);
+      console.log("Amazon non ha restituito una risposta valida.");
       return;
     }
 
@@ -268,35 +302,23 @@ async function checkAmazon(product) {
       )
     ) {
       console.log("Amazon ha restituito una pagina di verifica.");
-      console.log(`Inizio risposta: ${stripTags(html).slice(0, 250)}`);
+      console.log(`Inizio risposta: ${stripTags(html).slice(0, 300)}`);
       return;
     }
 
-    const titleMatch = html.match(
-      /<title[^>]*>([\s\S]*?)<\/title>/i
-    );
-
+    const titleMatch = html.match(/<title[^>]*>([\s\S]*?)<\/title>/i);
     console.log(
       `Titolo pagina: ${
         titleMatch ? stripTags(titleMatch[1]) : "non trovato"
       }`
     );
 
-    const price =
-      priceFromHtmlBlock(html, [
-        "corePrice_feature_div",
-        "corePriceDisplay_desktop_feature_div",
-        "corePrice_desktop",
-        "apex_desktop",
-        "priceblock_ourprice",
-        "priceblock_dealprice",
-        "price_inside_buybox",
-      ]) ?? priceFromJsonLd(html);
+    const price = extractAmazonPrice(html);
 
     if (price === null) {
       console.log("Prezzo Amazon non individuato.");
       console.log(
-        "Diagnostica: " +
+        "Indicatori: " +
           JSON.stringify({
             hasProductTitle: /id=["']productTitle["']/i.test(html),
             hasCorePrice: /corePrice_feature_div/i.test(html),
@@ -309,10 +331,8 @@ async function checkAmazon(product) {
               ),
           })
       );
-      console.log(
-        "Estratto iniziale HTML: " +
-          html.slice(0, 350).replace(/\s+/g, " ")
-      );
+
+      diagnoseAmazonHtml(html);
       return;
     }
 
@@ -350,7 +370,7 @@ async function checkCardmarket(browser, product) {
     if (status === 403 || status === 429) {
       console.log(
         "Cardmarket ha rifiutato o limitato la richiesta. " +
-        "Prezzo non verificato; nessuna notifica di offerta."
+          "Prezzo non verificato."
       );
       return;
     }
@@ -360,8 +380,7 @@ async function checkCardmarket(browser, product) {
       return;
     }
 
-    const bodyText = await page.locator("body").innerText()
-      .catch(() => "");
+    const bodyText = await page.locator("body").innerText().catch(() => "");
 
     if (/captcha|access denied|verify you are human/i.test(bodyText)) {
       console.log("Cardmarket richiede una verifica aggiuntiva.");
@@ -409,12 +428,13 @@ async function checkCardmarket(browser, product) {
 async function main() {
   console.log("Avvio monitor Warhammer.");
 
-  // Amazon: richieste HTTP dirette, senza Playwright.
+  // Prima visita la homepage Amazon, poi controlla i prodotti.
+  await warmUpAmazon();
+
   for (const product of AMAZON_PRODUCTS) {
     await checkAmazon(product);
   }
 
-  // Playwright viene usato esclusivamente per Cardmarket.
   const browser = await chromium.launch({ headless: true });
 
   try {
