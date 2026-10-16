@@ -9,6 +9,10 @@ const MAX_COLLECTOR_PRICE = 150; // soglia per le Collector's (link Cardtrader c
 const AMAZON_URLS = [
   "https://www.amazon.it/Magic-Gathering-Universes-Beyond-Warhammer/dp/B09ZJBPB34",
   "https://www.amazon.it/Magic-Gathering-Universes-Beyond-Warhammer/dp/B09ZJC7VGB",
+  "https://www.amazon.de/Magic-Gathering-Universes-Warhammer-Commander/dp/B09ZJC7VGB",
+  "https://www.amazon.de/-/en/Magic-Gathering-Beyond-Multiverse-Corruption/dp/B0BMLWH9GX",
+  "https://www.amazon.fr/Magic-Gathering-Universes-Beyond-Warhammer/dp/B09ZJC7VGB",
+  "https://www.amazon.fr/Magic-Gathering-Universes-Beyond-Warhammer/dp/B09ZJC7VGB",
 ];
 
 const CARDTRADER_URLS = [
