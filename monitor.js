@@ -1,5 +1,3 @@
-
-const https = require("https");
 const { chromium } = require("playwright");
 
 const MAX_PRICE = 90;
@@ -46,89 +44,174 @@ async function sendTelegram(message) {
     }
   );
 
-  if (!response.ok) {
-    throw new Error(`Telegram HTTP ${response.status}`);
+  const result = await response.json().catch(() => ({}));
+
+  if (!response.ok || !result.ok) {
+    throw new Error(
+      `Errore Telegram HTTP ${response.status}: ${
+        result.description || "invio non riuscito"
+      }`
+    );
   }
 }
 
-function notifyOffer(product, lowest) {
+async function notifyOffer(product, price) {
   const message =
     `Possibile offerta: ${product.name}\n` +
-    `Prezzo rilevato: €${lowest.toFixed(2)}\n` +
+    `Prezzo rilevato: €${price.toFixed(2)}\n` +
     `Soglia: €${MAX_PRICE}\n` +
     `Link: ${product.url}\n\n` +
     `Verifica manualmente disponibilità, venditore e spedizione.`;
 
-  console.log(message);
-  return sendTelegram(message);
+  console.log("\n" + message);
+  await sendTelegram(message);
 }
 
-// Amazon: richiesta HTTP diretta, senza Playwright.
-function getPage(url) {
-  return new Promise((resolve, reject) => {
-    const request = https.get(
-      url,
-      {
-        headers: {
-          "User-Agent":
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131.0 Safari/537.36",
-          "Accept-Language": "it-IT,it;q=0.9,en;q=0.8",
-        },
-      },
-      (response) => {
-        let html = "";
+// ---------------- AMAZON: SOLO HTTP, NESSUN PLAYWRIGHT ----------------
 
-        response.setEncoding("utf8");
-        response.on("data", (chunk) => (html += chunk));
-        response.on("end", () => {
-          if (response.statusCode >= 400) {
-            reject(new Error(`HTTP ${response.statusCode}: ${url}`));
-          } else {
-            resolve(html);
-          }
-        });
-      }
+async function getAmazonPage(url) {
+  const response = await fetch(url, {
+    redirect: "follow",
+    signal: AbortSignal.timeout(30000),
+    headers: {
+      "User-Agent":
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) " +
+        "AppleWebKit/537.36 (KHTML, like Gecko) " +
+        "Chrome/131.0.0.0 Safari/537.36",
+      "Accept":
+        "text/html,application/xhtml+xml,application/xml;q=0.9," +
+        "image/avif,image/webp,*/*;q=0.8",
+      "Accept-Language": "it-IT,it;q=0.9,en-US;q=0.8,en;q=0.7",
+      "Cache-Control": "no-cache",
+    },
+  });
+
+  const html = await response.text();
+
+  return {
+    status: response.status,
+    finalUrl: response.url,
+    html,
+  };
+}
+
+function decodeHtml(value) {
+  return value
+    .replace(/&euro;|&#8364;|&#x20ac;/gi, "€")
+    .replace(/&nbsp;|&#160;/gi, " ")
+    .replace(/&quot;/gi, '"')
+    .replace(/&amp;/gi, "&")
+    .replace(/&lt;/gi, "<")
+    .replace(/&gt;/gi, ">");
+}
+
+function stripTags(value) {
+  return decodeHtml(value.replace(/<[^>]*>/g, " "))
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function parseItalianPrice(value) {
+  if (!value) return null;
+
+  const text = decodeHtml(String(value))
+    .replace(/\s/g, "")
+    .replace(/[^\d.,]/g, "");
+
+  // Formato italiano: 1.234,56 oppure 69,99
+  if (/^\d{1,3}(?:\.\d{3})+,\d{2}$/.test(text)) {
+    const price = Number(text.replace(/\./g, "").replace(",", "."));
+    return Number.isFinite(price) && price > 0 ? price : null;
+  }
+
+  if (/^\d+,\d{2}$/.test(text)) {
+    const price = Number(text.replace(",", "."));
+    return Number.isFinite(price) && price > 0 ? price : null;
+  }
+
+  // Formato decimale con punto, utile per i dati strutturati.
+  if (/^\d+\.\d{2}$/.test(text)) {
+    const price = Number(text);
+    return Number.isFinite(price) && price > 0 ? price : null;
+  }
+
+  return null;
+}
+
+function priceFromHtmlBlock(html, selectors) {
+  for (const selector of selectors) {
+    const escaped = selector.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+    const blockPattern = new RegExp(
+      `<[^>]*id=["']${escaped}["'][^>]*>([\\s\\S]{0,12000}?)<\\/[^>]+>`,
+      "i"
     );
 
-    request.setTimeout(30000, () => {
-      request.destroy(new Error("Timeout"));
-    });
+    const block = html.match(blockPattern)?.[1];
 
-    request.on("error", reject);
-  });
+    if (!block) continue;
+
+    const priceElements = [
+      ...block.matchAll(
+        /<span\b[^>]*class=["'][^"']*\ba-offscreen\b[^"']*["'][^>]*>([\s\S]*?)<\/span>/gi
+      ),
+    ];
+
+    for (const element of priceElements) {
+      const price = parseItalianPrice(stripTags(element[1]));
+      if (price !== null) return price;
+    }
+
+    // Fallback limitato al contenitore prezzo.
+    const euroMatch = stripTags(block).match(
+      /€\s*(\d{1,3}(?:\.\d{3})*,\d{2}|\d+,\d{2})|(\d{1,3}(?:\.\d{3})*,\d{2}|\d+,\d{2})\s*€/
+    );
+
+    if (euroMatch) {
+      const price = parseItalianPrice(euroMatch[1] || euroMatch[2]);
+      if (price !== null) return price;
+    }
+  }
+
+  return null;
 }
 
-// Estrae un prezzo soltanto da un elemento selezionato.
-async function extractProductPrice(page) {
-  const selectors = [
-    "#corePrice_feature_div .a-price .a-offscreen",
-    "#corePriceDisplay_desktop_feature_div .a-price .a-offscreen",
-    "#price_inside_buybox",
-    "[data-testid='price-container']",
-    ".article-price",
-  ];
+function priceFromJsonLd(html) {
+  const scripts = html.matchAll(
+    /<script\b[^>]*type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi
+  );
 
-  for (const selector of selectors) {
-    const locator = page.locator(selector).first();
-
+  for (const script of scripts) {
     try {
-      const text = await locator.textContent({ timeout: 1500 });
+      const data = JSON.parse(script[1].trim());
+      const objects = Array.isArray(data) ? data : [data];
 
-      if (text) {
-        const match = text.replace(/\s/g, "").match(/(\d{1,4}(?:\.\d{3})*,\d{2})/);
+      for (const object of objects) {
+        const candidates = [
+          object,
+          ...(Array.isArray(object["@graph"]) ? object["@graph"] : []),
+        ];
 
-        if (match) {
-          const price = Number(
-            match[1].replace(/\./g, "").replace(",", ".")
-          );
+        for (const candidate of candidates) {
+          const offers = candidate.offers;
+          const offerList = Array.isArray(offers)
+            ? offers
+            : offers
+              ? [offers]
+              : [];
 
-          if (Number.isFinite(price) && price > 0) {
-            return price;
+          for (const offer of offerList) {
+            const currency = String(offer.priceCurrency || "").toUpperCase();
+
+            if (currency !== "EUR" || offer.price == null) continue;
+
+            const price = parseItalianPrice(offer.price);
+            if (price !== null) return price;
           }
         }
       }
     } catch {
-      console.log("Il selettore può non essere presente sulla pagina.");
+      // Ignora JSON-LD non valido.
     }
   }
 
@@ -139,42 +222,69 @@ async function checkAmazon(product) {
   console.log(`\nControllo Amazon via HTTP: ${product.name}`);
 
   try {
-    const html = await getPage(product.url);
+    const { status, finalUrl, html } = await getAmazonPage(product.url);
 
-    // Amazon può restituire pagine di blocco o CAPTCHA.
+    console.log(`HTTP status: ${status}`);
+    console.log(`URL finale: ${finalUrl}`);
+    console.log(`Dimensione HTML: ${html.length} caratteri`);
+
+    if (status < 200 || status >= 300) {
+      console.log("Amazon non ha restituito una pagina valida.");
+      console.log(`Inizio risposta: ${stripTags(html).slice(0, 250)}`);
+      return;
+    }
+
     if (
-      /captcha|robot check|automated access|sorry.*interrupted/i.test(html)
+      /captcha|robot check|validatecaptcha|automated access|sorry.*interrupted/i.test(
+        html
+      )
     ) {
       console.log("Amazon ha restituito una pagina di verifica.");
+      console.log(`Inizio risposta: ${stripTags(html).slice(0, 250)}`);
       return;
     }
 
-    // La richiesta HTTP non fornisce un DOM Playwright.
-    // Usiamo solo i contenitori prezzo noti di Amazon.
-    const priceMatch =
-      html.match(
-        /id="corePrice_feature_div"[\s\S]{0,5000}?class="a-offscreen">\s*([^<]+)</i
-      ) ||
-      html.match(
-        /id="corePriceDisplay_desktop_feature_div"[\s\S]{0,5000}?class="a-offscreen">\s*([^<]+)</i
+    const titleMatch = html.match(
+      /<title[^>]*>([\s\S]*?)<\/title>/i
+    );
+
+    console.log(
+      `Titolo pagina: ${
+        titleMatch ? stripTags(titleMatch[1]) : "non trovato"
+      }`
+    );
+
+    const price =
+      priceFromHtmlBlock(html, [
+        "corePrice_feature_div",
+        "corePriceDisplay_desktop_feature_div",
+        "corePrice_desktop",
+        "apex_desktop",
+        "priceblock_ourprice",
+        "priceblock_dealprice",
+        "price_inside_buybox",
+      ]) ?? priceFromJsonLd(html);
+
+    if (price === null) {
+      console.log("Prezzo Amazon non individuato.");
+      console.log(
+        "Diagnostica: " +
+          JSON.stringify({
+            hasProductTitle: /id=["']productTitle["']/i.test(html),
+            hasCorePrice: /corePrice_feature_div/i.test(html),
+            hasDesktopPrice: /corePriceDisplay_desktop_feature_div/i.test(html),
+            hasOffscreenPrice: /a-offscreen/i.test(html),
+            hasJsonLd: /application\/ld\+json/i.test(html),
+            possibleUnavailable:
+              /currently unavailable|temporarily out of stock|non disponibile/i.test(
+                html
+              ),
+          })
       );
-
-    if (!priceMatch) {
-      console.log("Prezzo Amazon non individuato in modo affidabile.");
-      return;
-    }
-
-    const match = priceMatch[1].match(/([\d.]+,\d{2})/);
-
-    if (!match) {
-      console.log("Formato del prezzo Amazon non riconosciuto.");
-      return;
-    }
-
-    const price = Number(match[1].replace(/\./g, "").replace(",", "."));
-
-    if (!Number.isFinite(price) || price <= 0) {
-      console.log("Prezzo Amazon non valido.");
+      console.log(
+        "Estratto iniziale HTML: " +
+          html.slice(0, 350).replace(/\s+/g, " ")
+      );
       return;
     }
 
@@ -182,11 +292,15 @@ async function checkAmazon(product) {
 
     if (price <= MAX_PRICE) {
       await notifyOffer(product, price);
+    } else {
+      console.log("Prezzo superiore alla soglia.");
     }
   } catch (error) {
     console.error(`Errore Amazon ${product.name}: ${error.message}`);
   }
 }
+
+// ---------------- CARDMARKET: PLAYWRIGHT ----------------
 
 async function checkCardmarket(browser, product) {
   console.log(`\nControllo Cardmarket via Playwright: ${product.name}`);
@@ -206,7 +320,10 @@ async function checkCardmarket(browser, product) {
     console.log(`HTTP status: ${status}`);
 
     if (status === 403 || status === 429) {
-      console.log("Cardmarket ha negato o limitato l'accesso.");
+      console.log(
+        "Cardmarket ha rifiutato o limitato la richiesta. " +
+        "Prezzo non verificato; nessuna notifica di offerta."
+      );
       return;
     }
 
@@ -214,11 +331,6 @@ async function checkCardmarket(browser, product) {
       console.log(`Pagina non disponibile: HTTP ${status}`);
       return;
     }
-
-    await page.waitForTimeout(2000);
-
-    const title = await page.title();
-    console.log(`Titolo pagina: ${title}`);
 
     const bodyText = await page.locator("body").innerText()
       .catch(() => "");
@@ -228,7 +340,26 @@ async function checkCardmarket(browser, product) {
       return;
     }
 
-    const price = await extractProductPrice(page);
+    const selectors = [
+      ".article-price",
+      ".price-container .price",
+      "[data-testid='price-container']",
+    ];
+
+    let price = null;
+
+    for (const selector of selectors) {
+      try {
+        const text = await page.locator(selector).first().innerText({
+          timeout: 1500,
+        });
+
+        price = parseItalianPrice(text);
+        if (price !== null) break;
+      } catch {
+        // Prova il selettore successivo.
+      }
+    }
 
     if (price === null) {
       console.log("Prezzo Cardmarket non individuato in modo affidabile.");
@@ -250,12 +381,12 @@ async function checkCardmarket(browser, product) {
 async function main() {
   console.log("Avvio monitor Warhammer.");
 
-  // Amazon usa HTTP diretto, non Playwright.
+  // Amazon: richieste HTTP dirette, senza Playwright.
   for (const product of AMAZON_PRODUCTS) {
     await checkAmazon(product);
   }
 
-  // Chromium è usato soltanto per Cardmarket.
+  // Playwright viene usato esclusivamente per Cardmarket.
   const browser = await chromium.launch({ headless: true });
 
   try {
@@ -270,6 +401,6 @@ async function main() {
 }
 
 main().catch((error) => {
-  console.error(error);
+  console.error("Errore fatale:", error);
   process.exitCode = 1;
 });
