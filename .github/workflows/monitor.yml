@@ -1,4 +1,3 @@
-
 name: Monitor Warhammer Decks
 
 on:
@@ -16,7 +15,7 @@ concurrency:
 jobs:
   monitor:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 5
 
     steps:
       - name: Checkout repository
@@ -29,18 +28,11 @@ jobs:
         with:
           node-version: "24"
 
-      - name: Install dependencies
-        run: npm install
-
-      - name: Install Chromium
-        run: npx playwright install --with-deps chromium
-
       - name: Run price monitor
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          CARDMARKET_USERNAME: ${{ secrets.CARDMARKET_USERNAME }}
-          CARDMARKET_PASSWORD: ${{ secrets.CARDMARKET_PASSWORD }}
+          CARDTRADER_TOKEN: ${{ secrets.CARDTRADER_TOKEN }}
         run: npm run monitor
 
       - name: Save monitoring state
