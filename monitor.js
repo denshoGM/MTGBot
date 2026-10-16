@@ -13,6 +13,8 @@ const AMAZON_URLS = [
   "https://www.amazon.de/Magic-Gathering-Beyond-Multiverse-Corruption/dp/B0BMLWH9GX",
   "https://www.amazon.fr/Magic-Gathering-Universes-Beyond-Warhammer/dp/B09ZJC7VGB?th=1",
   "https://www.amazon.fr/Magic-Gathering-Universes-Beyond-Warhammer/dp/B09ZJBPB34?th=1",
+  "https://www.amazon.es/Magic-Gathering-Multiverse-Warhammer-Commanders/dp/B09ZJC7VGB?th=1",
+  "https://www.amazon.es/Magic-Gathering-Multiverse-Warhammer-Commanders/dp/B09ZJBPB34?th=1",
 ];
 
 const CARDTRADER_URLS = [
