@@ -111,6 +111,39 @@ function sendTelegram(message) {
   });
 }
 
+
+async function main() {
+  await sendTelegram(
+    "✅ Test riuscito! Il monitor Warhammer è attivo su GitHub Actions."
+  );
+
+  for (const product of PRODUCTS) {
+    try {
+      console.log(`Controllo: ${product.name}`);
+
+      const html = await getPage(product.url);
+      const prices = extractPrices(html);
+      const eligible = prices.filter((price) => price <= MAX_PRICE);
+
+      if (eligible.length > 0) {
+        const lowest = Math.min(...eligible);
+
+        await sendTelegram(
+          `Possibile offerta: ${product.name}\n` +
+          `Prezzo rilevato: €${lowest.toFixed(2)}\n` +
+          `Link: ${product.url}\n` +
+          `Verifica disponibilità e spedizione.`
+        );
+      } else {
+        console.log("Nessun prezzo sotto soglia rilevato.");
+      }
+    } catch (error) {
+      console.error(`Errore su ${product.name}: ${error.message}`);
+    }
+  }
+}
+
+/*
 async function main() {
   for (const product of PRODUCTS) {
     try {
@@ -139,7 +172,7 @@ async function main() {
       console.error(`Errore su ${product.name}: ${error.message}`);
     }
   }
-}
+}*/
 
 main().catch((error) => {
   console.error(error);
