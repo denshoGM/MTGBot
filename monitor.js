@@ -22,6 +22,10 @@ const CARDTRADER_URLS = [
   "https://www.cardtrader.com/en-EU/cards/211577-universes-beyond-warhammer-40-000-tyranid-swarm-deck-collector-s-edition-universes-beyond-warhammer-40-000",
 ];
 
+// Pagina degli annunci Wizards: ti avvisa quando compare un NUOVO articolo che nomina una di queste parole.
+const WIZARDS_ANNOUNCEMENTS_URL = "https://magic.wizards.com/en/news/announcements";
+const WIZARDS_KEYWORDS = /warhammer|40k|40,000/i;
+
 // ============ FINE CONFIGURAZIONE ============
 
 const STATE_FILE = "state.json";
@@ -61,8 +65,6 @@ function loadState() {
   }
 }
 
-// Lo stato contiene solo { notified: true/false }, quindi il file cambia (e viene committato)
-// solo quando una notifica scatta o si azzera.
 function saveState(state) {
   fs.writeFileSync(STATE_FILE, JSON.stringify(state, null, 2) + "\n");
 }
@@ -112,6 +114,56 @@ async function handleResult(product, price, state) {
   }
 
   state[product.id] = { notified: ok };
+}
+
+// ============ ANNUNCI UFFICIALI WIZARDS ============
+
+// Legge l'elenco degli articoli nella pagina "Announcements" e avvisa per ogni articolo NUOVO
+// (non visto nelle esecuzioni precedenti) che nomina Warhammer / 40K.
+async function checkWizardsAnnouncements(state) {
+  const key = "wizards-announcements";
+
+  const res = await fetch(WIZARDS_ANNOUNCEMENTS_URL, {
+    signal: AbortSignal.timeout(30000),
+    headers: {
+      "User-Agent":
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+      Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+      "Accept-Language": "en-US,en;q=0.9",
+    },
+  });
+  console.log(`HTTP ${res.status}`);
+  if (!res.ok) return console.log("Pagina non raggiungibile; stato invariato.");
+
+  const html = await res.text();
+
+  // Ogni articolo ha un link /en/news/announcements/<slug>; il testo (titolo + riassunto) segue il link.
+  const links = [...html.matchAll(/href=["'](?:https?:\/\/magic\.wizards\.com)?(\/en\/news\/announcements\/[a-z0-9-]+)["']/gi)];
+  const articles = new Map(); // path -> testo
+  links.forEach((m, i) => {
+    const end = Math.min(links[i + 1]?.index ?? Infinity, m.index + 3000);
+    const text = stripTags(html.slice(m.index, end));
+    articles.set(m[1], `${articles.get(m[1]) || ""} ${text}`);
+  });
+
+  if (articles.size === 0) {
+    return console.log("Nessun articolo trovato: la struttura della pagina potrebbe essere cambiata; stato invariato.");
+  }
+  console.log(`Articoli letti: ${articles.size}`);
+
+  const seen = state[key]?.seen || [];
+  const fresh = [...articles.keys()].filter((path) => !seen.includes(path));
+  const matches = fresh.filter((path) => WIZARDS_KEYWORDS.test(`${path} ${articles.get(path)}`));
+  console.log(`Nuovi: ${fresh.length}, che nominano Warhammer: ${matches.length}`);
+
+  // Se l'invio fallisce, lo stato non viene aggiornato e al prossimo giro riprova.
+  for (const path of matches) {
+    const title = path.split("/").pop().replace(/-/g, " ");
+    await sendTelegram(`Nuovo annuncio ufficiale Wizards che cita Warhammer:\n${title}\nLink: https://magic.wizards.com${path}`);
+    console.log(`Notifica inviata: ${path}`);
+  }
+
+  state[key] = { seen: [...new Set([...articles.keys(), ...seen])].slice(0, 100) };
 }
 
 // ============ AMAZON ============
@@ -217,6 +269,14 @@ async function checkCardtrader(product, state) {
 async function main() {
   const state = loadState();
   console.log(`Monitor Warhammer - soglie: standard €${MAX_PRICE}, collector €${MAX_COLLECTOR_PRICE}`);
+
+  console.log("\nAnnunci ufficiali Wizards");
+  try {
+    await checkWizardsAnnouncements(state);
+  } catch (e) {
+    console.error(`Errore: ${e.message}`);
+  }
+  saveState(state);
 
   for (const product of PRODUCTS) {
     console.log(`\n${product.name}`);
