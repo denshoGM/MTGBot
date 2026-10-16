@@ -1,43 +1,53 @@
 const fs = require("node:fs");
 
-const MAX_PRICE = 90; // soglia per i mazzi standard
-const MAX_COLLECTOR_PRICE = 150; // soglia per le Collector's Edition
-const STATE_FILE = "state.json";
+// ============ CONFIGURAZIONE ============
 
+const MAX_PRICE = 90; // soglia per i mazzi standard
+const MAX_COLLECTOR_PRICE = 150; // soglia per le Collector's (link Cardtrader con "collector" nel nome)
+
+// Per aggiungere un prodotto basta incollare qui il link completo.
+const AMAZON_URLS = [
+  "https://www.amazon.it/Magic-Gathering-Universes-Beyond-Warhammer/dp/B09ZJBPB34",
+  "https://www.amazon.it/Magic-Gathering-Universes-Beyond-Warhammer/dp/B09ZJC7VGB",
+];
+
+const CARDTRADER_URLS = [
+  "https://www.cardtrader.com/en-EU/cards/211580-universes-beyond-warhammer-40-000-necron-dynasties-deck-universes-beyond-warhammer-40-000",
+  "https://www.cardtrader.com/en-EU/cards/211581-universes-beyond-warhammer-40-000-necron-dynasties-deck-collector-s-edition-universes-beyond-warhammer-40-000",
+  "https://www.cardtrader.com/en-EU/cards/211576-universes-beyond-warhammer-40-000-tyranid-swarm-deck-universes-beyond-warhammer-40-000",
+  "https://www.cardtrader.com/en-EU/cards/211577-universes-beyond-warhammer-40-000-tyranid-swarm-deck-collector-s-edition-universes-beyond-warhammer-40-000",
+];
+
+// ============ FINE CONFIGURAZIONE ============
+
+const STATE_FILE = "state.json";
 const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const CHAT_ID = process.env.TELEGRAM_CHAT_ID;
 const CARDTRADER_TOKEN = process.env.CARDTRADER_TOKEN;
 // Lingue accettate su Cardtrader (codici minuscoli, separati da virgola)
 const CARDTRADER_LANGS = (process.env.CARDTRADER_LANGS || "en,it").split(",").map((s) => s.trim());
 
-const AMZ = "https://www.amazon.it/Magic-Gathering-Universes-Beyond-Warhammer/dp/";
-const CT = "https://www.cardtrader.com/en-EU/cards/";
-
+// Costruisce l'elenco prodotti partendo dai link (id, nome e soglia si ricavano dal link).
 const PRODUCTS = [
-  { id: "necron-amazon", source: "amazon", name: "Necron Dynasties - Amazon", url: AMZ + "B09ZJBPB34" },
-  { id: "tyranid-amazon", source: "amazon", name: "Tyranid Swarm - Amazon", url: AMZ + "B09ZJC7VGB" },
-
-  { id: "necron-cardtrader", source: "cardtrader", blueprintId: 211580, name: "Necron Dynasties - Cardtrader", url: CT + "211580" },
-  {
-    id: "necron-collector-cardtrader",
-    source: "cardtrader",
-    blueprintId: 211581,
-    name: "Necron Dynasties (Collector's) - Cardtrader",
-    url: CT + "211581",
-    maxPrice: MAX_COLLECTOR_PRICE,
-  },
-  { id: "tyranid-cardtrader", source: "cardtrader", blueprintId: 211576, name: "Tyranid Swarm - Cardtrader", url: CT + "211576" },
-  {
-    id: "tyranid-collector-cardtrader",
-    source: "cardtrader",
-    blueprintId: 211577,
-    name: "Tyranid Swarm (Collector's) - Cardtrader",
-    url: CT + "211577",
-    maxPrice: MAX_COLLECTOR_PRICE,
-  },
+  ...AMAZON_URLS.map((url) => {
+    const asin = url.match(/\/dp\/([A-Z0-9]{10})/)?.[1] || url;
+    return { source: "amazon", url, id: `amazon-${asin}`, name: `Amazon ${asin}`, maxPrice: MAX_PRICE };
+  }),
+  ...CARDTRADER_URLS.map((url) => {
+    const [, blueprintId, slug] = url.match(/\/cards\/(\d+)-([^/?#]+)/) || [];
+    const isCollector = /collector/i.test(slug || "");
+    return {
+      source: "cardtrader",
+      url,
+      id: `cardtrader-${blueprintId}`,
+      blueprintId,
+      name: `Cardtrader ${(slug || url).replace(/-/g, " ")}`,
+      maxPrice: isCollector ? MAX_COLLECTOR_PRICE : MAX_PRICE,
+    };
+  }),
 ];
 
-// ---------- utilità ----------
+// ============ UTILITÀ ============
 
 function loadState() {
   try {
@@ -47,6 +57,8 @@ function loadState() {
   }
 }
 
+// Lo stato contiene solo { notified: true/false }, quindi il file cambia (e viene committato)
+// solo quando una notifica scatta o si azzera.
 function saveState(state) {
   fs.writeFileSync(STATE_FILE, JSON.stringify(state, null, 2) + "\n");
 }
@@ -85,11 +97,9 @@ function parsePrice(text) {
 
 // Notifica solo la prima volta che il prezzo scende sotto soglia.
 async function handleResult(product, price, state) {
-  const prev = state[product.id] || {};
-  const limit = product.maxPrice ?? MAX_PRICE;
-  const ok = price !== null && price <= limit;
+  const ok = price !== null && price <= product.maxPrice;
 
-  if (ok && !prev.notified) {
+  if (ok && !state[product.id]?.notified) {
     await sendTelegram(
       `Possibile offerta: ${product.name}\nPrezzo: €${price.toFixed(2)}\nSpedizione: da verificare\n` +
         `Link: ${product.url}\n\nVerifica disponibilità, lingua e condizioni del venditore.`
@@ -97,31 +107,51 @@ async function handleResult(product, price, state) {
     console.log("Notifica inviata.");
   }
 
-  state[product.id] = { notified: ok, lastPrice: price, checkedAt: new Date().toISOString() };
+  state[product.id] = { notified: ok };
 }
 
-// ---------- Amazon ----------
+// ============ AMAZON ============
+
+// Amazon a volte risponde con una pagina di verifica (breve, senza productTitle): riprova fino a 3 volte.
+async function fetchAmazonHtml(url) {
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      const res = await fetch(url, {
+        signal: AbortSignal.timeout(30000),
+        headers: {
+          "User-Agent":
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+          "Accept-Language": "it-IT,it;q=0.9",
+        },
+      });
+      const html = await res.text();
+      console.log(`Tentativo ${attempt}: HTTP ${res.status}, ${html.length} caratteri`);
+      if (res.ok && /id=["']productTitle["']/.test(html)) return html;
+    } catch (e) {
+      console.log(`Tentativo ${attempt}: ${e.message}`);
+    }
+    if (attempt < 3) await new Promise((r) => setTimeout(r, 5000 * attempt));
+  }
+  return null;
+}
 
 async function checkAmazon(product, state) {
-  const res = await fetch(product.url, {
-    signal: AbortSignal.timeout(30000),
-    headers: {
-      "User-Agent":
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-      "Accept-Language": "it-IT,it;q=0.9",
-    },
-  });
-  const html = await res.text();
-  console.log(`HTTP ${res.status}, ${html.length} caratteri`);
-  if (!res.ok) return console.log("Risposta non valida; stato invariato.");
-  if (!/id=["']productTitle["']/.test(html)) return console.log("Pagina prodotto non trovata (captcha?); stato invariato.");
+  const html = await fetchAmazonHtml(product.url);
+  if (!html) return console.log("Pagina prodotto non ottenuta (verifica anti-bot?); stato invariato.");
 
-  const block = html.match(/id=["']availability["'][^>]*>([\s\S]{0,3000}?)<\/div>/i);
-  const availText = block ? stripTags(block[1]).toLowerCase() : "";
+  // Nome leggibile dal titolo della pagina
+  const title = html.match(/id=["']productTitle["'][^>]*>([\s\S]*?)<\/span>/i);
+  if (title) product.name = `Amazon: ${stripTags(title[1]).slice(0, 100)}`;
+
+  // Testo subito dopo id="availability", senza script: i primi caratteri bastano.
+  const pos = html.search(/id=["']availability["']/i);
+  const availText = pos >= 0 ? stripTags(html.slice(pos, pos + 6000)).toLowerCase().slice(0, 300) : "";
   console.log(`Disponibilità: ${availText.slice(0, 120) || "(vuoto)"}`);
 
-  if (/non disponibile|esaurito|unavailable|out of stock/.test(availText)) {
-    state[product.id] = { notified: false, lastPrice: null, checkedAt: new Date().toISOString() };
+  const hasCartButton = /id=["']add-to-cart-button["']/.test(html);
+
+  if (/non disponibile|esaurito|unavailable|out of stock/.test(availText) || (!availText && !hasCartButton)) {
+    state[product.id] = { notified: false };
     return console.log("Non disponibile.");
   }
 
@@ -139,7 +169,7 @@ async function checkAmazon(product, state) {
   await handleResult(product, price, state);
 }
 
-// ---------- Cardtrader (API ufficiale) ----------
+// ============ CARDTRADER (API ufficiale) ============
 
 async function checkCardtrader(product, state) {
   if (!CARDTRADER_TOKEN) return console.log("Manca CARDTRADER_TOKEN; salto.");
@@ -167,7 +197,7 @@ async function checkCardtrader(product, state) {
 
   console.log(`Offerte ${CARDTRADER_LANGS.join("/")} trovate: ${prices.length} (su ${list.length})`);
   if (prices.length === 0) {
-    state[product.id] = { notified: false, lastPrice: null, checkedAt: new Date().toISOString() };
+    state[product.id] = { notified: false };
     return console.log("Nessuna offerta valida.");
   }
 
@@ -176,7 +206,7 @@ async function checkCardtrader(product, state) {
   await handleResult(product, best, state);
 }
 
-// ---------- main ----------
+// ============ MAIN ============
 
 async function main() {
   const state = loadState();
