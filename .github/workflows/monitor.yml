@@ -1,3 +1,4 @@
+
 name: Monitor Warhammer Decks
 
 on:
@@ -6,7 +7,11 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
+
+concurrency:
+  group: warhammer-price-monitor
+  cancel-in-progress: false
 
 jobs:
   monitor:
@@ -16,6 +21,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref_name }}
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -25,11 +32,24 @@ jobs:
       - name: Install dependencies
         run: npm install
 
-      - name: Install Chromium for Cardmarket
+      - name: Install Chromium
         run: npx playwright install --with-deps chromium
 
       - name: Run price monitor
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          CARDMARKET_USERNAME: ${{ secrets.CARDMARKET_USERNAME }}
+          CARDMARKET_PASSWORD: ${{ secrets.CARDMARKET_PASSWORD }}
         run: npm run monitor
+
+      - name: Save monitoring state
+        if: always()
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add state.json
+          if ! git diff --cached --quiet; then
+            git commit -m "Update product monitoring state"
+            git push
+          fi
