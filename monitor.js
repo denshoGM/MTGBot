@@ -2,8 +2,8 @@ const fs = require("node:fs");
 
 // ============ CONFIGURAZIONE ============
 
-const MAX_PRICE = 90; // soglia per i mazzi standard
-const MAX_COLLECTOR_PRICE = 150; // soglia per le Collector's (link Cardtrader con "collector" nel nome)
+const MAX_PRICE = Number(process.env.MAX_PRICE) || 90; // soglia per i mazzi standard
+const MAX_COLLECTOR_PRICE = Number(process.env.MAX_COLLECTOR_PRICE) || 150; // soglia per le Collector's
 const MIN_PRICE = 10; // sotto questa cifra il "prezzo" trovato è quasi certamente spazzatura (spedizione, prezzo unitario...)
 const HEALTH_ALERT_AFTER = 12; // dopo quanti run consecutivi falliti una fonte ti avvisa su Telegram
 
