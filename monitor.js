@@ -324,7 +324,7 @@ function amazonLanguage(url) {
 // Indicatori tipici di pagine di verifica o anti-bot.
 function isAmazonChallenge(html) {
   return (
-    /<form\b[^>]*action=["'][^"']*(?:validateCaptcha|captcha)/i.test(html) ||
+    /<form\b[^>]*action\s*=\s*["']?[^"'\s>]*(?:validateCaptcha|captcha)/i.test(html) ||
     /id=["']captchacharacters["']/i.test(html) ||
     /name=["']amzn-captcha-verify["']/i.test(html) ||
     /enter the characters you see below/i.test(html) ||
@@ -344,43 +344,38 @@ function amazonTarget(url) {
     : url;
 }
 
-// Cookie di sessione per marketplace: una visita alla home rende le richieste meno sospette.
-const amazonCookies = new Map();
+// Cookie di sessione per marketplace. Dopo il "Continua con gli acquisti" Amazon
+// assegna i cookie che permettono di vedere le pagine prodotto: li riusiamo per tutti i link dello stesso sito.
+const jars = new Map();
 
-async function warmAmazonSession(url) {
-  if (AMAZON_FETCH_TEMPLATE) return;
-
-  const host = new URL(url).hostname;
-  if (amazonCookies.has(host)) return;
-
-  amazonCookies.set(host, "");
-
-  try {
-    const res = await fetch(`https://${host}/`, {
-      signal: AbortSignal.timeout(20000),
-      headers: { "User-Agent": UA, "Accept-Language": amazonLanguage(url) },
-    });
-
-    const set =
-      typeof res.headers.getSetCookie === "function"
-        ? res.headers.getSetCookie()
-        : [];
-
-    amazonCookies.set(
-      host,
-      set.map((c) => c.split(";")[0]).join("; ")
-    );
-
-    console.log(`Sessione ${host}: HTTP ${res.status}, ${set.length} cookie`);
-  } catch (e) {
-    console.log(`Sessione ${host} non inizializzata: ${e.message}`);
-  }
+function jarFor(host) {
+  if (!jars.has(host)) jars.set(host, new Map());
+  return jars.get(host);
 }
 
-async function amazonHeaders(url) {
-  await warmAmazonSession(url);
+function storeCookies(host, res) {
+  const set =
+    typeof res.headers.getSetCookie === "function"
+      ? res.headers.getSetCookie()
+      : [];
+  const jar = jarFor(host);
 
+  for (const c of set) {
+    const pair = c.split(";")[0];
+    const i = pair.indexOf("=");
+    if (i > 0) jar.set(pair.slice(0, i).trim(), pair.slice(i + 1).trim());
+  }
+
+  return set.length;
+}
+
+function cookieHeader(host) {
+  return [...jarFor(host)].map(([k, v]) => `${k}=${v}`).join("; ");
+}
+
+function amazonHeaders(url) {
   const host = new URL(url).hostname;
+
   const headers = {
     "User-Agent": UA,
     Accept:
@@ -399,10 +394,38 @@ async function amazonHeaders(url) {
     Referer: `https://${host}/`,
   };
 
-  const cookie = amazonCookies.get(host);
+  const cookie = cookieHeader(host);
   if (cookie) headers.Cookie = cookie;
 
   return headers;
+}
+
+// GET con redirect gestiti a mano, per non perdere i cookie impostati nei passaggi intermedi.
+async function amazonGet(url, maxHops = 6) {
+  let current = url;
+
+  for (let hop = 0; hop <= maxHops; hop++) {
+    const host = new URL(current).hostname;
+
+    const res = await fetch(hop === 0 ? amazonTarget(current) : current, {
+      redirect: AMAZON_FETCH_TEMPLATE ? "follow" : "manual",
+      signal: AbortSignal.timeout(45000),
+      headers: amazonHeaders(current),
+    });
+
+    storeCookies(host, res);
+
+    const loc = res.headers.get("location");
+
+    if (!AMAZON_FETCH_TEMPLATE && res.status >= 300 && res.status < 400 && loc) {
+      current = new URL(loc, current).href;
+      continue;
+    }
+
+    return { res, html: await res.text() };
+  }
+
+  throw new Error("Troppi redirect");
 }
 
 // Riassunto breve di una pagina non riconosciuta, per capire dai log cosa risponde Amazon.
@@ -412,64 +435,98 @@ function describeHtml(html) {
   return `title="${stripTags(title).slice(0, 80)}" testo="${body}"`;
 }
 
+// La pagina "Fai clic sul pulsante qui sotto per continuare a fare acquisti" non è un captcha vero:
+// è un form con campi nascosti che basta inviare. Un captcha vero (con immagine) invece no.
+function isAmazonClickThrough(html) {
+  return (
+    isAmazonChallenge(html) &&
+    !/captchacharacters|amzn-captcha-verify|enter the characters/i.test(html)
+  );
+}
+
+async function passAmazonClickThrough(html, pageUrl) {
+  const form = html.match(/<form\b[^>]*>[\s\S]*?<\/form>/i)?.[0];
+
+  if (!form) {
+    console.log("Interstitial Amazon senza form: non so come proseguire.");
+    return false;
+  }
+
+  const decode = (s) => s.replace(/&amp;/g, "&");
+
+  const formTag = form.match(/<form\b[^>]*>/i)[0];
+  const action = decode(
+    formTag.match(/action\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))/i)?.slice(1).find(Boolean) ||
+      "/errors/validateCaptcha"
+  );
+
+  const target = new URL(action, pageUrl);
+
+  // Legge un attributo con o senza virgolette: name="x" / name='x' / name=x
+  const attr = (tag, key) => {
+    const m = tag.match(
+      new RegExp(`\\b${key}\\s*=\\s*(?:"([^"]*)"|'([^']*)'|([^\\s>]+))`, "i")
+    );
+    return m ? (m[1] ?? m[2] ?? m[3] ?? "") : null;
+  };
+
+  for (const m of form.matchAll(/<input\b[^>]*>/gi)) {
+    const name = attr(m[0], "name");
+    const value = attr(m[0], "value") ?? "";
+
+    if (name) target.searchParams.set(name, decode(value));
+  }
+
+  const host = new URL(pageUrl).hostname;
+
+  const { res } = await amazonGet(target.href);
+
+  console.log(
+    `Click su "Continua": HTTP ${res.status}, cookie in sessione: ${jarFor(host).size}`
+  );
+
+  return true;
+}
+
 async function fetchAmazonHtml(url) {
-  const maxAttempts = 3;
+  const maxAttempts = 4;
 
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     try {
-      const res = await fetch(amazonTarget(url), {
-        signal: AbortSignal.timeout(45000),
-        headers: await amazonHeaders(url),
-      });
-
-      const html = await res.text();
+      const { res, html } = await amazonGet(url);
 
       console.log(
         `Tentativo ${attempt}: HTTP ${res.status}, ${html.length} caratteri`
       );
 
-      if (!res.ok || !/id=["'](?:productTitle|availability)["']/i.test(html)) {
-        console.log(`Risposta: ${describeHtml(html)}`);
-      }
+      const isProduct =
+        /id=["'](?:productTitle|add-to-cart-button|corePrice_feature_div)["']/i.test(
+          html
+        ) || /id=["']availability["']/i.test(html);
 
-      // Amazon risponde 503 + captcha ai client sospetti: spesso è un blocco, non un errore reale.
-      if (!res.ok) {
-        if (isAmazonChallenge(html)) {
-          console.log("Verifica anti-bot Amazon (captcha).");
-        } else if (res.status === 404) {
-          console.log("404: ASIN non esistente su questo marketplace.");
-          return null;
-        }
+      if (res.ok && isProduct) return html;
 
-        if (attempt < maxAttempts && res.status >= 500) {
-          await sleep(attempt * 5000);
-          continue;
-        }
+      console.log(`Risposta: ${describeHtml(html)}`);
 
+      if (res.status === 404) {
+        console.log("404: ASIN non esistente su questo marketplace.");
         return null;
       }
 
-      const hasProductTitle = /id=["']productTitle["']/i.test(html);
-
-      const hasProductSignals =
-        /id=["']availability["']/i.test(html) ||
-        /id=["']add-to-cart-button["']/i.test(html) ||
-        /id=["']corePrice_feature_div["']/i.test(html);
-
-      if (hasProductTitle || hasProductSignals) {
-        return html;
+      if (isAmazonClickThrough(html)) {
+        console.log('Pagina "continua con gli acquisti": invio il form.');
+        await passAmazonClickThrough(html, url);
+        continue; // riprova subito con i cookie appena ottenuti
       }
 
-      console.log(
-        isAmazonChallenge(html)
-          ? "Pagina di verifica Amazon rilevata; riprovo."
-          : "HTML senza indicatori di una pagina prodotto; riprovo."
-      );
+      if (isAmazonChallenge(html)) {
+        console.log("Captcha vero di Amazon: da questo IP non si passa.");
+      }
 
-      if (attempt < maxAttempts) await sleep(attempt * 5000);
+      if (attempt < maxAttempts) await sleep(attempt * 4000);
     } catch (e) {
       console.log(`Errore di rete al tentativo ${attempt}: ${e.message}`);
-      if (attempt < maxAttempts) await sleep(attempt * 5000);
+      if (attempt < maxAttempts) await sleep(attempt * 4000);
     }
   }
 
@@ -526,17 +583,21 @@ async function checkAmazon(product, state) {
   }
 
   const pos = html.search(/id=["']availability["']/i);
+  const textStart = pos >= 0 ? html.indexOf(">", pos) + 1 : -1;
 
   const availText =
-    pos >= 0
-      ? stripTags(html.slice(pos, pos + 6000)).toLowerCase().slice(0, 300)
+    textStart > 0
+      ? stripTags(html.slice(textStart, textStart + 6000))
+          .toLowerCase()
+          .slice(0, 300)
       : "";
 
   console.log(`Disponibilità: ${availText.slice(0, 120) || "(vuoto)"}`);
 
   const hasCartButton = /id=["']add-to-cart-button["']/i.test(html);
 
-  if (AMAZON_UNAVAILABLE.test(availText) || (!availText && !hasCartButton)) {
+  // Se c'è il pulsante "Aggiungi al carrello" l'articolo è acquistabile.
+  if (!hasCartButton && (AMAZON_UNAVAILABLE.test(availText) || !availText)) {
     state[product.id] = { notified: false };
     console.log("Non disponibile.");
     return true;
