@@ -588,16 +588,22 @@ async function checkAmazon(product, state) {
   const availText =
     textStart > 0
       ? stripTags(html.slice(textStart, textStart + 6000))
+          // Elimina eventuali frammenti di tag rimasti (stripTags non li toglie se il tag è tagliato).
+          .replace(/<[^>]{0,2000}>?/g, " ")
+          .replace(/\s+/g, " ")
+          .trim()
           .toLowerCase()
           .slice(0, 300)
       : "";
-
+  
   console.log(`Disponibilità: ${availText.slice(0, 120) || "(vuoto)"}`);
 
-  const hasCartButton = /id=["']add-to-cart-button["']/i.test(html);
+  const hasCartButton = /id=["'](?:add-to-cart-button|buy-now-button)["']/i.test(html);
+  const hasOutOfStockBlock = /id=["']outOfStock["']/i.test(html);
 
-  // Se c'è il pulsante "Aggiungi al carrello" l'articolo è acquistabile.
-  if (!hasCartButton && (AMAZON_UNAVAILABLE.test(availText) || !availText)) {
+  // Se c'è un pulsante di acquisto l'articolo è acquistabile; senza pulsante e con
+  // testo "non disponibile" (o senza alcun testo di disponibilità) non lo è.
+  if (!hasCartButton &&(hasOutOfStockBlock || AMAZON_UNAVAILABLE.test(availText) || !availText)) {
     state[product.id] = { notified: false };
     console.log("Non disponibile.");
     return true;
@@ -606,7 +612,15 @@ async function checkAmazon(product, state) {
   const price = extractAmazonPrice(html);
 
   if (price === null) {
-    console.log("Prezzo non trovato; stato invariato.");
+    // Pagina letta bene ma senza prezzo e senza pulsante di acquisto: nessuna offerta diretta.
+    if (!hasCartButton) {
+      state[product.id] = { notified: false };
+      console.log("Nessuna offerta acquistabile (niente pulsante di acquisto né prezzo).");
+      return true;
+    }
+
+    // C'è il pulsante ma non trovo il prezzo: struttura cambiata, da segnalare.
+    console.log("Pulsante di acquisto presente ma prezzo non trovato; stato invariato.");
     return false;
   }
 
