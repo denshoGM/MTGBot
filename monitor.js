@@ -2,8 +2,8 @@ const fs = require("node:fs");
 
 // ============ CONFIGURAZIONE ============
 
-const MAX_PRICE = Number(process.env.MAX_PRICE) || 90; // soglia per i mazzi standard
-const MAX_COLLECTOR_PRICE = Number(process.env.MAX_COLLECTOR_PRICE) || 150; // soglia per le Collector's
+const MAX_PRICE = 90; // soglia per i mazzi standard
+const MAX_COLLECTOR_PRICE = 150; // soglia per le Collector's (link Cardtrader con "collector" nel nome)
 const MIN_PRICE = 10; // sotto questa cifra il "prezzo" trovato è quasi certamente spazzatura (spedizione, prezzo unitario...)
 const HEALTH_ALERT_AFTER = 12; // dopo quanti run consecutivi falliti una fonte ti avvisa su Telegram
 
@@ -17,6 +17,12 @@ const AMAZON_URLS = [
   "https://www.amazon.fr/Magic-Gathering-Universes-Beyond-Warhammer/dp/B09ZJBPB34?th=1",
   "https://www.amazon.es/Magic-Gathering-Multiverse-Warhammer-Commanders/dp/B09ZJC7VGB?th=1",
   "https://www.amazon.es/Magic-Gathering-Multiverse-Warhammer-Commanders/dp/B09ZJBPB34?th=1",
+];
+
+// Link Amazon controllati SOLO per la disponibilità: nessun controllo sul prezzo.
+// Ti avvisa soltanto quando l'articolo passa da non disponibile ad acquistabile.
+const AMAZON_AVAILABILITY_ONLY_URLS = [
+  "https://www.amazon.it/Confezione-Collector-Booster-Magic-Gathering/dp/B0HK9YL6PJ",
 ];
 
 const CARDTRADER_URLS = [
@@ -59,6 +65,20 @@ const PRODUCTS = [
       id: `amazon-${site}-${asin}`,
       name: `Amazon.${site} ${asin}`,
       maxPrice: MAX_PRICE,
+    };
+  }),
+
+  ...AMAZON_AVAILABILITY_ONLY_URLS.map((url) => {
+    const asin = url.match(/\/dp\/([A-Z0-9]{10})/)?.[1] || url;
+    const site = new URL(url).hostname.split(".").pop();
+
+    return {
+      source: "amazon",
+      url,
+      id: `amazon-${site}-${asin}`,
+      name: `Amazon.${site} ${asin}`,
+      maxPrice: MAX_PRICE, // non usato: availabilityOnly ignora il prezzo
+      availabilityOnly: true,
     };
   }),
 
@@ -595,7 +615,7 @@ async function checkAmazon(product, state) {
           .toLowerCase()
           .slice(0, 300)
       : "";
-  
+
   console.log(`Disponibilità: ${availText.slice(0, 120) || "(vuoto)"}`);
 
   const hasCartButton = /id=["'](?:add-to-cart-button|buy-now-button)["']/i.test(html);
@@ -606,6 +626,31 @@ async function checkAmazon(product, state) {
   if (!hasCartButton &&(hasOutOfStockBlock || AMAZON_UNAVAILABLE.test(availText) || !availText)) {
     state[product.id] = { notified: false };
     console.log("Non disponibile.");
+    return true;
+  }
+
+  // Link "solo disponibilità": avvisa quando diventa acquistabile, senza guardare il prezzo.
+  if (product.availabilityOnly) {
+    if (hasCartButton) {
+      if (!state[product.id]?.notified) {
+        const info = extractAmazonPrice(html); // solo informativo, nessuna soglia
+
+        await sendTelegram(
+          `Tornato disponibile: ${product.name}\n` +
+            (info !== null ? `Prezzo indicato: €${info.toFixed(2)}\n` : "") +
+            `Link: ${product.url}\n\n` +
+            `Verifica venditore e condizioni.`
+        );
+
+        console.log("Notifica inviata (tornato disponibile).");
+      }
+
+      state[product.id] = { notified: true };
+    } else {
+      state[product.id] = { notified: false };
+      console.log("Non acquistabile (nessun pulsante di acquisto).");
+    }
+
     return true;
   }
 
