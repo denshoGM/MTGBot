@@ -123,22 +123,35 @@ function stripTags(html) {
 
 // "1.234,56 €" / "49,90" / "49.90" -> numero
 function parsePrice(text) {
-  const t = String(text ?? "").replace(/[^\d.,]/g, "");
+  let t = String(text ?? "")
+    .replace(/[^\d.,]/g, "");
 
-  let n;
+  if (!t || !/\d/.test(t)) return null;
 
-  if (/^\d{1,3}(\.\d{3})+,\d{2}$/.test(t)) {
-    n = t.replace(/\./g, "").replace(",", ".");
-  } else if (/^\d+,\d{2}$/.test(t)) {
-    n = t.replace(",", ".");
-  } else if (/^\d+\.\d{2}$/.test(t)) {
-    n = t;
-  } else {
-    return null;
+  const comma = t.lastIndexOf(",");
+  const dot = t.lastIndexOf(".");
+
+  if (comma >= 0 && dot >= 0) {
+    // L'ultimo separatore è quello decimale.
+    const decimalSeparator = comma > dot ? "," : ".";
+    const thousandsSeparator = decimalSeparator === "," ? "." : ",";
+
+    t = t.split(thousandsSeparator).join("");
+    t = t.replace(decimalSeparator, ".");
+  } else if (comma >= 0 || dot >= 0) {
+    const separator = comma >= 0 ? "," : ".";
+    const parts = t.split(separator);
+    const decimals = parts[parts.length - 1];
+
+    if (decimals.length === 1 || decimals.length === 2) {
+      t = parts.slice(0, -1).join("") + "." + decimals;
+    } else {
+      t = parts.join("");
+    }
   }
 
-  const v = Number(n);
-  return v > 0 ? v : null;
+  const value = Number(t);
+  return Number.isFinite(value) && value > 0 ? value : null;
 }
 
 // Notifica solo la prima volta che il prezzo scende sotto soglia.
@@ -256,17 +269,21 @@ function amazonLanguage(url) {
 
 // Indicatori tipici di pagine di verifica o anti-bot.
 function isAmazonChallenge(html) {
-  return /captcha|robot check|validatecaptcha|automated access|enter the characters you see below|to discuss automated access|sorry.{0,80}robot|access denied|unusual traffic/i.test(
-    html
+  return (
+    /<form\b[^>]*action=["'][^"']*(?:validateCaptcha|captcha)/i.test(html) ||
+    /id=["']captchacharacters["']/i.test(html) ||
+    /name=["']amzn-captcha-verify["']/i.test(html) ||
+    /enter the characters you see below/i.test(html) ||
+    /sorry.{0,80}robot/i.test(html) ||
+    /to discuss automated access/i.test(html)
   );
 }
 
-// Restituisce l'HTML solo quando sembra una vera pagina prodotto.
-// Non confonde un HTTP 200 con una richiesta riuscita.
 async function fetchAmazonHtml(url) {
-  const maxNetworkAttempts = 3;
+  const maxAttempts = 3;
+  let lastHtml = null;
 
-  for (let attempt = 1; attempt <= maxNetworkAttempts; attempt++) {
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     try {
       const res = await fetch(url, {
         signal: AbortSignal.timeout(30000),
@@ -274,7 +291,7 @@ async function fetchAmazonHtml(url) {
           "User-Agent":
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
           Accept:
-            "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+            "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
           "Accept-Language": amazonLanguage(url),
           "Upgrade-Insecure-Requests": "1",
         },
@@ -287,52 +304,62 @@ async function fetchAmazonHtml(url) {
       );
 
       if (!res.ok) {
-        console.log(
-          `Amazon ha restituito HTTP ${res.status}; nessun retry immediato.`
-        );
+        console.log(`Risposta HTTP ${res.status}; stato invariato.`);
+
+        if (attempt < maxAttempts && res.status >= 500) {
+          await new Promise((resolve) =>
+            setTimeout(resolve, attempt * 5000)
+          );
+          continue;
+        }
+
         return null;
       }
 
-      if (/id=["']productTitle["']/i.test(html)) {
+      lastHtml = html;
+
+      const hasProductTitle =
+        /id=["']productTitle["']/i.test(html);
+
+      const hasProductSignals =
+        /id=["']availability["']/i.test(html) ||
+        /id=["']add-to-cart-button["']/i.test(html) ||
+        /id=["']corePrice_feature_div["']/i.test(html) ||
+        /class=["'][^"']*\ba-offscreen\b/i.test(html);
+
+      if (hasProductTitle || hasProductSignals) {
         return html;
       }
 
       if (isAmazonChallenge(html)) {
         console.log(
-          "Pagina di verifica/anti-bot rilevata; stato invariato."
+          "Pagina di verifica Amazon rilevata; riprovo senza modificare lo stato."
         );
-        return null;
-      }
-
-      if (html.length < 20000) {
+      } else {
         console.log(
-          "Pagina troppo breve e senza productTitle; possibile verifica anti-bot."
+          "HTML senza indicatori sufficienti di una pagina prodotto; riprovo."
         );
-        return null;
       }
 
-      console.log(
-        "HTML ricevuto ma productTitle assente: possibile modifica della pagina Amazon."
-      );
-
-      return null;
+      if (attempt < maxAttempts) {
+        await new Promise((resolve) =>
+          setTimeout(resolve, attempt * 5000)
+        );
+      }
     } catch (e) {
       console.log(
         `Errore di rete al tentativo ${attempt}: ${e.message}`
       );
 
-      if (attempt < maxNetworkAttempts) {
-        const delayMs = attempt === 1 ? 5000 : 15000;
-
-        console.log(
-          `Nuovo tentativo per errore di rete tra ${delayMs / 1000} secondi.`
+      if (attempt < maxAttempts) {
+        await new Promise((resolve) =>
+          setTimeout(resolve, attempt * 5000)
         );
-
-        await new Promise((resolve) => setTimeout(resolve, delayMs));
       }
     }
   }
 
+  // Non analizzare una pagina incompleta come se fosse un prodotto.
   return null;
 }
 
@@ -376,22 +403,47 @@ async function checkAmazon(product, state) {
     return console.log("Non disponibile.");
   }
 
-  const start = html.search(
-    /id=["'](corePrice_feature_div|corePriceDisplay_desktop_feature_div|apex_desktop)["']/
-  );
-
   let price = null;
 
-  if (start >= 0) {
-    for (const m of html
-      .slice(start, start + 30000)
-      .matchAll(
-        /class=["'][^"']*a-offscreen[^"']*["'][^>]*>([^<]*)</g
-      )) {
-      price = parsePrice(m[1]);
+  // Cerca prima nelle sezioni Amazon che normalmente contengono
+  // il prezzo dell'offerta principale.
+  const priceSections = [
+    /id=["']corePrice_feature_div["'][\s\S]*?(?=<div[^>]+id=["'](?:availability|buybox)["']|$)/i,
+    /id=["']corePriceDisplay_desktop_feature_div["'][\s\S]*?(?=<div[^>]+id=["'](?:availability|buybox)["']|$)/i,
+    /id=["']apex_desktop["'][\s\S]*?(?=<div[^>]+id=["'](?:availability|buybox)["']|$)/i,
+    /id=["']priceToPay["'][\s\S]{0,5000}/i,
+  ];
 
-      if (price !== null) break;
+  const candidates = [];
+
+  for (const sectionRegex of priceSections) {
+    const section = html.match(sectionRegex);
+
+    if (section) {
+      candidates.push(section[0]);
     }
+  }
+
+  // Fallback: cerca in tutta la pagina se Amazon ha cambiato struttura.
+  candidates.push(html);
+
+  for (const section of candidates) {
+    const matches = [
+      ...section.matchAll(
+        /class=["'][^"']*\ba-offscreen\b[^"']*["'][^>]*>([^<]*)</gi
+      ),
+    ];
+
+    for (const match of matches) {
+      const parsed = parsePrice(stripTags(match[1]));
+
+      if (parsed !== null) {
+        price = parsed;
+        break;
+      }
+    }
+
+    if (price !== null) break;
   }
 
   if (price === null) {
