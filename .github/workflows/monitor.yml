@@ -1,3 +1,4 @@
+
 name: Monitor Warhammer Decks
 
 on:
@@ -19,15 +20,16 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: "24"
+          package-manager-cache: false
 
       - name: Restore state
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v5
         with:
           path: state.json
           key: state-${{ github.run_id }}
@@ -42,7 +44,7 @@ jobs:
 
       - name: Save state
         if: always()
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v5
         with:
           path: state.json
           key: state-${{ github.run_id }}
