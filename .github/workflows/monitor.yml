@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
         max_price:
-          description: "Soglia mazzi standard (€), vuoto = 90"
+          description: "Soglia mazzi standard (€), vuoto = 125"
           required: false
           default: ""
         max_collector_price:
